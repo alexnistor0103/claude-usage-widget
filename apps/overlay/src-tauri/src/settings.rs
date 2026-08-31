@@ -130,7 +130,7 @@ impl Default for Settings {
             thresholds: Thresholds::default(),
             autostart: false,
             click_through: false,
-            always_on_top: true,
+            always_on_top: false,
             show_scoped: true,
             colors: BTreeMap::new(),
             dock: Dock::default(),
@@ -238,6 +238,11 @@ pub fn save(app: &AppHandle, s: &Settings) -> Result<(), String> {
 }
 
 pub fn validate(mut s: Settings) -> Settings {
+    // A docked widget is placed over its target and floats above it anyway,
+    // so docking turns the global always-on-top off rather than fighting it.
+    if s.dock.enabled {
+        s.always_on_top = false;
+    }
     s.opacity = if s.opacity.is_finite() {
         s.opacity.clamp(0.2, 1.0)
     } else {
@@ -523,6 +528,18 @@ mod tests {
     }
 
     #[test]
+    fn enabling_docking_turns_always_on_top_off() {
+        let mut s = Settings::default();
+        s.always_on_top = true;
+        s.dock.enabled = true;
+        assert!(!validate(s).always_on_top);
+
+        let mut undocked = Settings::default();
+        undocked.always_on_top = true;
+        assert!(validate(undocked).always_on_top);
+    }
+
+    #[test]
     fn validate_drops_bad_colors() {
         let mut s = Settings::default();
         s.colors.insert("ok".into(), "#6ea8fe".into());
@@ -599,7 +616,7 @@ mod tests {
         );
 
         let mut top = base.clone();
-        top.always_on_top = false;
+        top.always_on_top = true;
         assert_eq!(
             diff(&base, &top),
             Effects {

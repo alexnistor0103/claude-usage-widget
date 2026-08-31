@@ -544,6 +544,12 @@ fn try_reacquire(st: &mut HookState) -> bool {
 
 /// `follow_focus`: an allowed window that takes the foreground takes over.
 fn follow(st: &mut HookState, hwnd: isize) {
+    // Only while docked or searching for a lost target. After an explicit
+    // detach the tracker is idle, and clicking an allowed window must not
+    // re-dock on its own.
+    if st.target.is_none() && !st.searching {
+        return;
+    }
     let root = find::root_of(hwnd);
     if st.target == Some(root) {
         return;

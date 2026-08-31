@@ -557,6 +557,12 @@ fn on_front_change(st: &mut State, front: Option<i32>) {
 
 /// `follow_focus`: an allowed application that comes to the front takes over.
 fn follow(st: &mut State, front: Option<i32>) {
+    // Only while docked or searching for a lost target. After an explicit
+    // detach the tracker is idle, and clicking an allowed application must
+    // not re-dock on its own.
+    if st.target.is_none() && !st.searching {
+        return;
+    }
     let Some(pid) = front else {
         return;
     };

@@ -118,7 +118,7 @@ function defaultSettings() {
     thresholds: { warn: 75, crit: 90 },
     autostart: false,
     click_through: false,
-    always_on_top: true,
+    always_on_top: false,
     show_scoped: true,
     colors: {},
     dock: {
@@ -1280,7 +1280,11 @@ function openSettings() {
   refs.alwaysOnTop = checkboxInput(settings.always_on_top);
   track(refs.alwaysOnTop, "always_on_top");
   card.appendChild(
-    fieldRow("Always on top", refs.alwaysOnTop, "Off: other windows can cover the widget. Docking stays on top regardless."),
+    fieldRow(
+      "Always on top",
+      refs.alwaysOnTop,
+      "A docked widget floats over its target anyway; enabling docking turns this off.",
+    ),
   );
 
   const err = document.createElement("div");
