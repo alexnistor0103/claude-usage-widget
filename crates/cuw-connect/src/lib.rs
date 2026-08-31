@@ -1001,8 +1001,23 @@ fn strip_ansi(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         match b[i] {
-            0x1b => i = skip_escape(b, i),
-            0x07 | 0x08 => i += 1, // BEL, backspace
+            0x1b => {
+                let next = skip_escape(b, i);
+                // A cursor move or erase means the next text is painted
+                // somewhere else on screen: without a separator, two unrelated
+                // paints would glue into one run — which is how a captured
+                // token once grew a tail of UI prose. SGR (`m`) is only color.
+                if moves_cursor(&b[i..next]) {
+                    out.push('\n');
+                }
+                i = next;
+            }
+            0x08 => {
+                // Backspace moves the cursor too.
+                out.push('\n');
+                i += 1;
+            }
+            0x07 => i += 1, // BEL
             _ => {
                 let start = i;
                 while i < b.len() && !matches!(b[i], 0x1b | 0x07 | 0x08) {
@@ -1013,6 +1028,13 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     out
+}
+
+/// Whether one stripped escape sequence repositions or erases — anything CSI
+/// that is not SGR coloring. OSC/DCS and two-byte escapes leave the cursor
+/// where it is, so they stay silent and prose spanning them stays whole.
+fn moves_cursor(seq: &[u8]) -> bool {
+    seq.get(1) == Some(&b'[') && seq.last().is_some_and(|f| *f != b'm')
 }
 
 /// Advance past one escape sequence starting at `b[i] == ESC`; returns the index
@@ -1061,9 +1083,9 @@ const TOKEN_MARKER: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 /// digits after it are deliberately not pinned.
 const CLI_TOKEN_PREFIX: &str = "sk-ant-oat";
 
-/// Shortest run accepted as a token. Real ones are ~110 characters; this only
-/// rules out a truncated redraw.
-const CLI_TOKEN_MIN: usize = 40;
+/// Shortest run accepted as a token. Real ones are ~110 characters; anything
+/// well short of that is a partial repaint, and storing one costs a reconnect.
+const CLI_TOKEN_MIN: usize = 80;
 
 /// The CLI token in `setup-token`'s output, if one has finished printing.
 ///
@@ -1077,7 +1099,10 @@ fn find_cli_token(acc: &str) -> Option<&str> {
     while let Some(rel) = acc[from..].find(CLI_TOKEN_PREFIX) {
         let start = from + rel;
         let run = token_run(&acc[start..]);
-        let terminated = start + run.len() < acc.len();
+        // Line end only: the CLI prints the token on a line of its own, and
+        // strip_ansi turns every cursor move into `\n` — any other terminator
+        // means the run absorbed adjacent screen text and is not a token.
+        let terminated = matches!(acc.as_bytes().get(start + run.len()), Some(b'\n' | b'\r'));
         if terminated && run.len() >= CLI_TOKEN_MIN {
             return Some(run);
         }
@@ -1173,7 +1198,8 @@ mod tests {
     const TOKEN: &str = "sk-ant-oat01-FAKEFAKEFAKEFAKEFAKEFAKE0003";
 
     /// A stand-in for what `setup-token` prints: same prefix, real-ish length.
-    const CLI_TOKEN: &str = "sk-ant-oat01-FAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLI0008";
+    // Real-token length (113): the capture now rejects short runs as partials.
+    const CLI_TOKEN: &str = "sk-ant-oat01-FAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLI00000008";
 
     fn now() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_756_600_000).expect("timestamp")
@@ -1524,6 +1550,30 @@ mod tests {
         assert_eq!(find_cli_token(&whole), Some(CLI_TOKEN));
     }
 
+    /// The 2026-08-31 field bug: the TUI painted the token, moved the cursor,
+    /// and painted prose; with the escapes stripped silently the two glued into
+    /// one run and the stored "token" ended in `...store`. The cursor move must
+    /// become a separator, and the clean token must still come out.
+    #[test]
+    fn a_cursor_move_after_the_token_does_not_glue_ui_text_onto_it() {
+        let raw = format!("{CLI_TOKEN}\x1b[2;5Hcredential-store says hi");
+        let clean = strip_ansi(&raw);
+        assert_eq!(find_cli_token(&clean), Some(CLI_TOKEN));
+
+        // Without a separator the glued run must be rejected, not stored.
+        let glued = format!("{CLI_TOKEN}credential-store ");
+        assert_eq!(find_cli_token(&glued), None);
+    }
+
+    /// Color changes are not cursor moves: prose spanning an SGR stays whole,
+    /// so cross-chunk prompt detection keeps working.
+    #[test]
+    fn sgr_does_not_split_text_but_a_cursor_move_does() {
+        assert_eq!(strip_ansi("paste \x1b[1mcode\x1b[m"), "paste code");
+        assert_eq!(strip_ansi("one\x1b[5;1Htwo"), "one\ntwo");
+        assert_eq!(strip_ansi("one\x08two"), "one\ntwo");
+    }
+
     #[test]
     fn a_short_run_is_not_a_token() {
         // The prefix alone, and a run under the minimum, are both redraw noise.
@@ -1535,7 +1585,7 @@ mod tests {
     #[test]
     fn the_prefix_version_digits_are_not_pinned() {
         let next = CLI_TOKEN.replace("oat01", "oat02");
-        assert_eq!(find_cli_token(&format!("{next} ")), Some(next.as_str()));
+        assert_eq!(find_cli_token(&format!("{next}\n")), Some(next.as_str()));
     }
 
     #[test]
