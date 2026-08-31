@@ -1,5 +1,6 @@
 /target
 **/target
+/dist
 /apps/overlay/src-tauri/gen
 
 # runtime state (account ids, chosen dock target) — user-specific

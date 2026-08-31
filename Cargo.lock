@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-connect"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "cuw-core",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "rand",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-creds"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cuw-core",
  "keyring",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-launch"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "thiserror 2.0.20",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-tracker"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "objc2",
@@ -2655,7 +2655,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "objc2-exception-helper"
-version = "0.1.1"
