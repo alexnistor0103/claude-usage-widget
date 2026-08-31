@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cuw-core",
+    "crates/cuw-creds",
+    "crates/cuw-connect",
+    "crates/cuw-daemon",
+    "crates/cuw-tracker",
+    "crates/cuw-launch",
+]
+# apps/overlay/src-tauri is a detached package (its own [workspace]): Tauri is
+# M3, kept out of the backend build so M0–M2 stay quick to check.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+cuw-core = { path = "crates/cuw-core" }
+cuw-creds = { path = "crates/cuw-creds" }
+cuw-connect = { path = "crates/cuw-connect" }
+cuw-tracker = { path = "crates/cuw-tracker" }
+cuw-launch = { path = "crates/cuw-launch" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+reqwest = { version = "0.12", features = ["json"] }
+async-trait = "0.1"
+time = "0.3"
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

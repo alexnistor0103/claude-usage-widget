@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged into the generated Info.plist by the bundler, which picks this file up
+  because it sits beside tauri.conf.json (tauri-cli interface/rust.rs). macOS
+  only; the NSIS build never reads it.
+
+  LSUIElement is the launch-time half of the Accessory activation policy set in
+  lib.rs: without it the widget owns a Dock icon and a Cmd-Tab entry for the
+  moment between launch and `setup` running.
+-->
+<plist version="1.0">
+  <dict>
+    <key>LSUIElement</key>
+    <true/>
+  </dict>
+</plist>

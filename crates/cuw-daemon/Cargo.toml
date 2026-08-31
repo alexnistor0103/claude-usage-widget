@@ -1,0 +1,39 @@
+[package]
+name = "cuw-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "cuw_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cuw-daemon"
+path = "src/main.rs"
+
+[dependencies]
+cuw-core.workspace = true
+cuw-creds.workspace = true
+cuw-connect.workspace = true
+cuw-launch.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+async-trait.workspace = true
+time = { workspace = true, features = ["formatting", "parsing"] }
+rand.workspace = true
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+directories = "5"
+constant_time_eq = "0.3"
+
+[dev-dependencies]
+sha2 = "0.10"
+tower = { version = "0.5", features = ["util"] }
+tokio = { workspace = true, features = ["full", "test-util"] }

@@ -1,0 +1,86 @@
+# Windows and macOS, plus the cross-target check that guards macOS code written
+# on a Windows box. The macOS job is the first real Apple toolchain this code
+# meets, so it builds the overlay too, and it must stay runnable without a
+# browser, a keychain unlock or a signing identity, so nothing here bundles,
+# signs, connects an account or runs an `#[ignore]`d test.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  host:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14]
+    env:
+      # Nothing in CI may reach a real data dir or a real credential, whatever a
+      # future test does (STATUS, 2026-08-31).
+      CUW_DATA_DIR: ${{ runner.temp }}/cuw-data
+      CUW_KEYRING_SERVICE: com.local.cuw-ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The overlay is a detached package with its own target dir.
+          workspaces: |
+            . -> target
+            apps/overlay/src-tauri -> target
+      - name: shell scripts parse
+        if: runner.os == 'macOS'
+        run: for f in scripts/*.sh; do sh -n "$f"; done
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      # The root workspace does not contain the overlay, so it needs its own
+      # invocation. No bundling: that wants an installer toolchain and a release
+      # daemon to package (scripts/build-release.ps1 / .sh).
+      - name: cargo fmt --check (overlay)
+        working-directory: apps/overlay/src-tauri
+        run: cargo fmt --check
+      - name: cargo clippy (overlay)
+        working-directory: apps/overlay/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo test (overlay)
+        working-directory: apps/overlay/src-tauri
+        run: cargo test
+
+  macos-cross:
+    # The safety net the macOS work was written against: `cargo check` never
+    # links, so an Apple target type-checks from Windows. Enforced here so it
+    # cannot rot (scripts/check-macos.ps1).
+    name: ${{ matrix.target }} from windows
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-check-${{ matrix.target }}
+          workspaces: |
+            . -> target/macos-check
+            apps/overlay/src-tauri -> target/macos-check
+      - run: powershell -NoProfile -File scripts/check-macos.ps1 -Target ${{ matrix.target }}

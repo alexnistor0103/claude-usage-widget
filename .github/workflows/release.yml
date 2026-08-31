@@ -1,0 +1,57 @@
+# Installer builds for handing out: the NSIS .exe from Windows and a universal
+# (x86_64 + arm64) .dmg from macOS, via the same scripts a laptop would use.
+# Manual trigger only — unsigned artefacts, so nothing publishes itself.
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+          workspaces: |
+            . -> target
+            apps/overlay/src-tauri -> target
+      - name: install tauri-cli
+        run: cargo install tauri-cli --locked
+      - run: powershell -NoProfile -File scripts/build-release.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: apps/overlay/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  macos:
+    name: macos installer (universal)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+          workspaces: |
+            . -> target
+            apps/overlay/src-tauri -> target
+      - name: install tauri-cli
+        run: cargo install tauri-cli --locked
+      - run: sh scripts/build-release.sh --universal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer
+          path: apps/overlay/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error

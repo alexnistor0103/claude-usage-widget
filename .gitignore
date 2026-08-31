@@ -1,0 +1,11 @@
+/target
+**/target
+/apps/overlay/src-tauri/gen
+
+# runtime state (account ids, chosen dock target) — user-specific
+accounts.toml
+cuw.token
+*.log
+
+.DS_Store
+Thumbs.db

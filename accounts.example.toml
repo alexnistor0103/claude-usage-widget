@@ -1,0 +1,12 @@
+# Copy to accounts.toml. Holds the account registry and daemon port only —
+# never tokens. Tokens live in the OS credential store, keyed by `id`.
+
+port = 8787
+
+# [[accounts]]
+# id = "personal"
+# label = "Personal"
+#
+# [[accounts]]
+# id = "work"
+# label = "Work"

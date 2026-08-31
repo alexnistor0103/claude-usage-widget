@@ -1,0 +1,19 @@
+[package]
+name = "cuw-connect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cuw-core.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
+portable-pty = "0.9"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

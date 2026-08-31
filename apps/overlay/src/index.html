@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Claude Usage</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main id="widget">
+      <div id="bar">
+        <span id="dock-badge" class="badge" hidden></span>
+        <span class="spacer"></span>
+        <button id="dock" type="button" class="icon" title="Dock to a window" hidden>⌖</button>
+        <button id="gear" type="button" class="icon" title="Settings">⚙</button>
+      </div>
+      <div id="rows"></div>
+      <button id="connect" type="button">+ Connect account</button>
+      <div id="status" class="status"></div>
+    </main>
+    <div id="modal-root"></div>
+    <script src="main.js"></script>
+  </body>
+</html>

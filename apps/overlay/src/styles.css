@@ -1,0 +1,436 @@
+:root {
+  --bg-alpha: 0.85;
+  --bg: rgba(20, 20, 22, var(--bg-alpha));
+  --card: rgba(28, 28, 32, 0.98);
+  --fg: #e8e8ea;
+  --muted: #8a8a92;
+  --track: rgba(255, 255, 255, 0.1);
+  --bar: #25a062ff;
+  --warn: #f0a83c;
+  --crit: #f0574c;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+}
+
+html,
+body {
+  background: transparent;
+  color: var(--fg);
+  font: 12px/1.35 system-ui, -apple-system, Segoe UI, sans-serif;
+  user-select: none;
+  cursor: default;
+}
+
+/* Dragging is a mousedown handler calling startDragging (M6.4); WebView2 has
+   no CSS drag region. */
+#widget {
+  cursor: default;
+  background: var(--bg);
+  border-radius: 12px;
+  padding: 10px 12px;
+  min-height: 100vh;
+}
+
+/* --- header bar --------------------------------------------------------- */
+
+#bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 2px;
+  min-height: 18px;
+}
+
+#bar .spacer {
+  flex: 1;
+}
+
+.badge {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge.detached {
+  color: var(--warn);
+}
+
+.row {
+  padding: 6px 0;
+}
+
+/* Last-good numbers held without a fresh 200 are visibly stale (plan §3). */
+.row.stale {
+  opacity: 0.6;
+}
+
+.row .label {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.row .label .name {
+  flex: 1;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row .label .right.crit {
+  color: var(--crit);
+}
+
+.row .label .right.muted {
+  color: var(--muted);
+}
+
+.bar {
+  height: 5px;
+  background: var(--track);
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 3px 0;
+}
+
+.bar>span {
+  display: block;
+  height: 100%;
+  background: var(--bar);
+}
+
+.bar.warn>span {
+  background: var(--warn);
+}
+
+.bar.crit>span {
+  background: var(--crit);
+}
+
+.secondary {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 1px 0 3px;
+}
+
+.secondary.warn {
+  color: var(--warn);
+}
+
+/* per-model weekly windows, collapsed behind a toggle line */
+.scoped {
+  font-size: 11px;
+  color: var(--muted);
+  padding-left: 8px;
+}
+
+.scoped.active {
+  color: var(--fg);
+}
+
+.scoped.toggle {
+  cursor: pointer;
+  padding-left: 0;
+}
+
+.row:not(.scoped-open) .scoped.entry {
+  display: none;
+}
+
+body.compact .bar,
+body.compact .secondary,
+body.compact .scoped {
+  display: none;
+}
+
+.empty {
+  padding: 8px 0;
+  color: var(--muted);
+}
+
+#connect {
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px;
+  border: 0;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--fg);
+  cursor: pointer;
+}
+
+#connect:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+/* per-row disconnect and switch */
+.icon {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.icon:hover {
+  color: var(--crit);
+}
+
+/* Switching is the one row action that destroys nothing. */
+.icon.switch:hover {
+  color: var(--bar);
+}
+
+/* An account with no CLI grant (SWITCHER §6): a state, with its own way out. */
+.secondary.switch-note .btn.small {
+  vertical-align: baseline;
+}
+
+.status {
+  margin-top: 6px;
+  color: var(--muted);
+  min-height: 1em;
+}
+
+/* --- modal ------------------------------------------------------------- */
+
+#modal-root:not(.open) {
+  display: none;
+}
+
+.modal {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.card {
+  width: 100%;
+  max-width: 320px;
+  background: var(--card);
+  border-radius: 10px;
+  padding: 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.card-title {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.card .msg {
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+.card .input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--track);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--fg);
+  user-select: text;
+  margin-bottom: 10px;
+}
+
+.card .log {
+  max-height: 160px;
+  overflow-y: auto;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.35);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--fg);
+  user-select: text;
+  margin-bottom: 10px;
+}
+
+.card .log-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.card .signin-url {
+  color: var(--bar);
+  user-select: all;
+  word-break: break-all;
+}
+
+/* code-paste row, revealed when the CLI awaits the authorization code */
+.card .code-box {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.card .code-box .input {
+  flex: 1;
+  margin-bottom: 0;
+}
+
+.card .code-box .btn {
+  white-space: nowrap;
+}
+
+.card .actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.btn {
+  padding: 5px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.btn.primary {
+  background: var(--bar);
+  color: #10131a;
+}
+
+.btn.danger {
+  background: var(--crit);
+  color: #1a0f0e;
+}
+
+.btn.small {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
+/* --- settings panel ------------------------------------------------------ */
+
+.card.settings {
+  max-width: 340px;
+  max-height: 90vh;
+  overflow-y: auto;
+}
+
+.settings .section-title {
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  margin: 10px 0 4px;
+}
+
+.settings .field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0;
+}
+
+.settings .field>.flabel {
+  flex: 1;
+  color: var(--fg);
+}
+
+.settings .field .note {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.settings .field input[type="number"] {
+  width: 56px;
+  padding: 3px 6px;
+  border: 1px solid var(--track);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--fg);
+  user-select: text;
+}
+
+.settings .field input[type="text"] {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  border: 1px solid var(--track);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--fg);
+  user-select: text;
+}
+
+.settings .field select {
+  padding: 3px 6px;
+  border: 1px solid var(--track);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--fg);
+}
+
+.settings .field input[type="range"] {
+  width: 130px;
+}
+
+.settings .field input[type="color"] {
+  width: 28px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--track);
+  border-radius: 4px;
+  background: transparent;
+}
+
+.settings textarea {
+  width: 100%;
+  min-height: 64px;
+  padding: 6px 8px;
+  border: 1px solid var(--track);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  user-select: text;
+  resize: vertical;
+}
+
+/* A note under a full-width control, rather than beside a label. */
+.settings .note.block {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 3px 0 2px;
+}
+
+.settings .readonly {
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 170px;
+}
+
+.card .error {
+  color: var(--crit);
+  font-size: 11px;
+  margin: 4px 0 8px;
+}
