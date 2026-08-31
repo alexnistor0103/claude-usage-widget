@@ -546,6 +546,33 @@ function setDock(payload) {
   }
 }
 
+// --- Update check -----------------------------------------------------------
+
+// Six hours: the widget stays open for days, and the check is one
+// unauthenticated GitHub request that must not be worth rate-limiting.
+const UPDATE_EVERY_MS = 6 * 60 * 60 * 1000;
+
+// The release page for the version last offered; null when nothing is offered.
+let updateUrl = null;
+
+// Rust answers with a value for every outcome — offline, rate-limited, no
+// release published — so "no update" is the only failure the UI has.
+async function checkUpdate() {
+  const btn = document.getElementById("update");
+  if (!btn) return;
+  let info = null;
+  try {
+    info = await invoke("check_update");
+  } catch {
+    return; // plain browser — leave the pill hidden
+  }
+  const ok = info && info.available === true && typeof info.latest === "string";
+  updateUrl = ok && typeof info.url === "string" ? info.url : null;
+  btn.hidden = !ok;
+  btn.textContent = ok ? `Update v${info.latest}` : "";
+  btn.title = ok ? "Open the release page" : "";
+}
+
 // --- Modals -----------------------------------------------------------------
 
 // The open modal's cancel path, for Escape. Null when nothing is open, and
@@ -1399,6 +1426,10 @@ document.getElementById("connect").addEventListener("click", async () => {
 
 document.getElementById("gear").addEventListener("click", openSettings);
 
+document.getElementById("update").addEventListener("click", () => {
+  if (updateUrl) invoke("open_release", { url: updateUrl }).catch(() => {});
+});
+
 document.getElementById("dock").addEventListener("click", () => {
   const docked = dockState === "docked" || dockState === "detached";
   invoke(docked ? "dock_stop" : "dock_pick").catch(() => {});
@@ -1468,6 +1499,9 @@ function clearStatus() {
   invoke("dock_state")
     .then(setDock)
     .catch(() => {});
+
+  checkUpdate();
+  setInterval(checkUpdate, UPDATE_EVERY_MS);
 
   streamLoop();
 })();

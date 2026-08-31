@@ -261,6 +261,7 @@ dependencies = [
  "cuw-launch",
  "directories",
  "rand",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

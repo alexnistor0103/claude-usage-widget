@@ -60,6 +60,25 @@ body {
   color: var(--warn);
 }
 
+/* Shown only when a newer release exists; hidden the rest of the time. */
+.pill {
+  border: 0;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.pill:hover {
+  background: rgba(255, 255, 255, 0.16);
+  color: var(--fg);
+}
+
 .row {
   padding: 6px 0;
 }

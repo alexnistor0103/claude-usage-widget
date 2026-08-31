@@ -8,6 +8,7 @@ mod dock;
 mod platform;
 mod settings;
 mod tray;
+mod update;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -573,6 +574,8 @@ pub fn run() {
             daemon_port,
             modal_interactive,
             open_url,
+            update::check_update,
+            update::open_release,
             settings::get_settings,
             settings::set_settings,
             dock::dock_start,
