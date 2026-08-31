@@ -72,7 +72,8 @@ fi
 # built in the same run carries a complete app.
 echo '== cargo tauri build =='
 (
-    cd "$overlay" && cargo tauri build --config \
+    cd "$overlay" && cargo tauri build \
+        ${universal:+--target universal-apple-darwin} --config \
         '{"bundle":{"resources":{"../../../target/release/cuw-daemon":"cuw-daemon"}}}'
 )
 
