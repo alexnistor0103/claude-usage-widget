@@ -66,6 +66,15 @@ if [ ! -f "$daemon" ]; then
     exit 1
 fi
 
+# Notarization rejects any unsigned executable in the bundle, and the daemon
+# rides along as a resource the bundler does not sign. Hardened runtime and a
+# timestamp are both notarization requirements.
+if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+    echo '== codesign cuw-daemon =='
+    codesign --force --options runtime --timestamp \
+        --sign "$APPLE_SIGNING_IDENTITY" "$daemon"
+fi
+
 # Inside a .app the executable is in Contents/MacOS while a bundle resource
 # lands in Contents/Resources, which is exactly where the overlay's
 # `bundled_daemon` looks - so the resource needs no copy afterwards and a .dmg

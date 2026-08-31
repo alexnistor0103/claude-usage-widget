@@ -49,7 +49,17 @@ jobs:
             apps/overlay/src-tauri -> target
       - name: install tauri-cli
         run: cargo install tauri-cli --locked
+      # Signing and notarization are driven entirely by the Tauri bundler off
+      # these env vars; with the secrets unset the build stays unsigned (ad-hoc)
+      # and still succeeds, so the pipeline never depends on the Apple account.
       - run: sh scripts/build-release.sh --universal
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       - uses: actions/upload-artifact@v4
         with:
           name: macos-installer
