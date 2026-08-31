@@ -52,14 +52,19 @@ jobs:
       # Signing and notarization are driven entirely by the Tauri bundler off
       # these env vars; with the secrets unset the build stays unsigned (ad-hoc)
       # and still succeeds, so the pipeline never depends on the Apple account.
-      # A secret that is set but unusable (bad base64, wrong password) would
-      # fail the bundler's own import, so it is tried here first and dropped.
+      # A missing secret still reaches the shell as a SET-but-empty variable,
+      # which the bundler reads as "sign with zero bytes of certificate" — so
+      # empty vars are unset, and a non-empty certificate is import-tested
+      # first and dropped when it is unusable (bad base64, wrong password).
       - run: |
-          if [ -n "$APPLE_CERTIFICATE" ]; then
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!v}" ]; then unset "$v"; fi
+          done
+          if [ -n "${APPLE_CERTIFICATE:-}" ]; then
             kc="$RUNNER_TEMP/check.keychain"; p12="$RUNNER_TEMP/check.p12"
             if ! { printf '%s' "$APPLE_CERTIFICATE" | base64 -d > "$p12" 2>/dev/null \
                 && security create-keychain -p check "$kc" \
-                && security import "$p12" -k "$kc" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign >/dev/null 2>&1; }; then
+                && security import "$p12" -k "$kc" -P "${APPLE_CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign >/dev/null 2>&1; }; then
               echo "::warning::signing secrets are present but unusable; building unsigned"
               unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
             fi
