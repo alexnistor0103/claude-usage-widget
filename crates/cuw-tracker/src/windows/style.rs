@@ -5,29 +5,34 @@
 
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
-    HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     WS_EX_TOOLWINDOW,
 };
 
 use super::find::hwnd;
 
-/// ORs `WS_EX_TOOLWINDOW` into the ex-style (hides the overlay from Alt-Tab).
+/// ORs `WS_EX_TOOLWINDOW` into the ex-style (hides the overlay from Alt-Tab)
+/// and asserts the z-order `topmost` asks for (the always-on-top setting).
 /// tao rewrites the ex-style on every flag diff, so call again after any
 /// show/hide/set_focusable. Main thread only.
-pub fn set_tool_window(h: isize) {
+pub fn set_tool_window(h: isize, topmost: bool) {
     // SAFETY: plain style read/write on a handle we own; SetWindowPos only
-    // re-applies the frame (no move, size, z-order or activation).
+    // re-applies the frame and the z-order band (no move, size or activation).
     unsafe {
         let ex = GetWindowLongPtrW(hwnd(h), GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd(h), GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW.0 as isize);
         let _ = SetWindowPos(
             hwnd(h),
-            None,
+            Some(if topmost {
+                HWND_TOPMOST
+            } else {
+                HWND_NOTOPMOST
+            }),
             0,
             0,
             0,
             0,
-            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
 }

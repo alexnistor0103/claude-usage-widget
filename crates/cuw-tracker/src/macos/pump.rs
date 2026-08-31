@@ -535,6 +535,12 @@ fn on_front_change(st: &mut State, front: Option<i32>) {
         end_pick(st, front);
         return;
     }
+    // Clicking the overlay activates our own application. That is the user
+    // using the widget, not the target losing them — reporting it as an
+    // unfocus would hide the widget under the user's cursor.
+    if front == own_pid() {
+        return;
+    }
     if !st.searching {
         if let Some(pid) = st.target_pid {
             send_focused(st, front == Some(pid));

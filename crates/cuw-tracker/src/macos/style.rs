@@ -8,8 +8,8 @@
 //! `NSWindow` pointer; [`bring_to_foreground`] takes a `CGWindowID`.
 
 use objc2_app_kit::{
-    NSApplicationActivationOptions, NSFloatingWindowLevel, NSRunningApplication, NSWindow,
-    NSWindowCollectionBehavior,
+    NSApplicationActivationOptions, NSFloatingWindowLevel, NSNormalWindowLevel,
+    NSRunningApplication, NSWindow, NSWindowCollectionBehavior,
 };
 
 use super::find;
@@ -22,7 +22,9 @@ use super::find;
 /// activation policy (`NSApplication::setActivationPolicy`), which the overlay
 /// owns. Unlike Windows, nothing rewrites this behind our back, but the overlay
 /// calls it after show/hide anyway so one dock body serves both platforms.
-pub fn set_tool_window(h: isize) {
+/// `topmost` picks the level: floating above ordinary windows, or a normal
+/// window other applications may cover (the always-on-top setting).
+pub fn set_tool_window(h: isize, topmost: bool) {
     let Some(window) = ns_window(h) else {
         return;
     };
@@ -30,7 +32,11 @@ pub fn set_tool_window(h: isize) {
         NSWindowCollectionBehavior::CanJoinAllSpaces
             | NSWindowCollectionBehavior::FullScreenAuxiliary,
     );
-    window.setLevel(NSFloatingWindowLevel);
+    window.setLevel(if topmost {
+        NSFloatingWindowLevel
+    } else {
+        NSNormalWindowLevel
+    });
 }
 
 /// Re-asserts the floating level. Call on Attached/Restored only, never per
@@ -69,7 +75,8 @@ mod tests {
 
     #[test]
     fn a_null_window_pointer_is_ignored_rather_than_dereferenced() {
-        set_tool_window(0);
+        set_tool_window(0, true);
+        set_tool_window(0, false);
         assert_topmost(0);
     }
 

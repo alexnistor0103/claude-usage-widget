@@ -118,6 +118,7 @@ function defaultSettings() {
     thresholds: { warn: 75, crit: 90 },
     autostart: false,
     click_through: false,
+    always_on_top: true,
     show_scoped: true,
     colors: {},
     dock: {
@@ -1276,23 +1277,25 @@ function openSettings() {
     fieldRow("Click-through", refs.clickThrough, "Turn it off again from the tray icon."),
   );
 
+  refs.alwaysOnTop = checkboxInput(settings.always_on_top);
+  track(refs.alwaysOnTop, "always_on_top");
+  card.appendChild(
+    fieldRow("Always on top", refs.alwaysOnTop, "Off: other windows can cover the widget. Docking stays on top regardless."),
+  );
+
   const err = document.createElement("div");
   err.className = "error";
   err.hidden = true;
   const actions = document.createElement("div");
   actions.className = "actions";
-  const cancel = makeButton("Cancel", "");
-  const save = makeButton("Save", "primary");
-  actions.append(cancel, save);
+  const done = makeButton("Done", "primary");
+  actions.append(done);
   card.append(err, actions);
 
-  cancel.onclick = () => {
-    closeModal();
-    applySettings(); // revert the live opacity preview
-  };
-  modalCancel = () => cancel.click();
-
-  save.onclick = async () => {
+  // Settings save automatically: Done, Escape and a click outside the panel
+  // all run the same save; an invalid field keeps the panel open instead.
+  let saving = false;
+  const saveAndClose = async () => {
     err.hidden = true;
     const patch = {};
     if (touched.has("opacity")) patch.opacity = Number(refs.opacity.value);
@@ -1310,6 +1313,7 @@ function openSettings() {
     }
     if (touched.has("autostart")) patch.autostart = refs.autostart.checked;
     if (touched.has("click_through")) patch.click_through = refs.clickThrough.checked;
+    if (touched.has("always_on_top")) patch.always_on_top = refs.alwaysOnTop.checked;
     if (touched.has("colors")) {
       const map = { ...(settings.colors || {}) };
       for (const [id, inp] of refs.colorInputs) map[id] = inp.value;
@@ -1336,14 +1340,28 @@ function openSettings() {
     }
     if (Object.keys(sessionPatch).length) patch.session = sessionPatch;
 
+    if (!Object.keys(patch).length) {
+      closeModal();
+      return;
+    }
+    if (saving) return;
+    saving = true;
     try {
       await invoke("set_settings", { patch });
       closeModal(); // settings-changed re-renders everything
     } catch (e) {
       err.textContent = String(e);
       err.hidden = false;
+    } finally {
+      saving = false;
     }
   };
+
+  done.onclick = saveAndClose;
+  modalCancel = saveAndClose;
+  card.parentElement.addEventListener("mousedown", (e) => {
+    if (e.target === card.parentElement) saveAndClose();
+  });
 
   panelRefs = refs;
 }
@@ -1370,6 +1388,9 @@ function refreshPanelFromSettings() {
   if (untouched("autostart") && r.autostart) r.autostart.checked = settings.autostart === true;
   if (untouched("click_through") && r.clickThrough) {
     r.clickThrough.checked = settings.click_through === true;
+  }
+  if (untouched("always_on_top") && r.alwaysOnTop) {
+    r.alwaysOnTop.checked = settings.always_on_top === true;
   }
   const d = settings.dock || {};
   if (untouched("dock.enabled") && r.dockEnabled) r.dockEnabled.checked = d.enabled === true;

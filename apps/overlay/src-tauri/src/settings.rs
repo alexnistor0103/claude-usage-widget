@@ -20,6 +20,7 @@ pub struct Settings {
     pub thresholds: Thresholds,
     pub autostart: bool,
     pub click_through: bool,
+    pub always_on_top: bool,
     pub show_scoped: bool,
     pub colors: BTreeMap<String, String>,
     pub dock: Dock,
@@ -94,6 +95,7 @@ pub struct SettingsPatch {
     pub thresholds: Option<Thresholds>,
     pub autostart: Option<bool>,
     pub click_through: Option<bool>,
+    pub always_on_top: Option<bool>,
     pub show_scoped: Option<bool>,
     pub colors: Option<BTreeMap<String, String>>,
     pub dock: Option<DockPatch>,
@@ -128,6 +130,7 @@ impl Default for Settings {
             thresholds: Thresholds::default(),
             autostart: false,
             click_through: false,
+            always_on_top: true,
             show_scoped: true,
             colors: BTreeMap::new(),
             dock: Dock::default(),
@@ -269,6 +272,7 @@ pub fn merge(base: &mut Settings, patch: SettingsPatch) {
         thresholds,
         autostart,
         click_through,
+        always_on_top,
         show_scoped,
         colors,
         dock,
@@ -288,6 +292,9 @@ pub fn merge(base: &mut Settings, patch: SettingsPatch) {
     }
     if let Some(v) = click_through {
         base.click_through = v;
+    }
+    if let Some(v) = always_on_top {
+        base.always_on_top = v;
     }
     if let Some(v) = show_scoped {
         base.show_scoped = v;
@@ -359,7 +366,7 @@ struct Effects {
 
 fn diff(old: &Settings, new: &Settings) -> Effects {
     Effects {
-        style: old.click_through != new.click_through,
+        style: old.click_through != new.click_through || old.always_on_top != new.always_on_top,
         autostart: old.autostart != new.autostart,
         placement: old.dock.corner != new.dock.corner
             || old.dock.offset != new.dock.offset
@@ -585,6 +592,16 @@ mod tests {
         ct.click_through = true;
         assert_eq!(
             diff(&base, &ct),
+            Effects {
+                style: true,
+                ..Effects::default()
+            }
+        );
+
+        let mut top = base.clone();
+        top.always_on_top = false;
+        assert_eq!(
+            diff(&base, &top),
             Effects {
                 style: true,
                 ..Effects::default()
