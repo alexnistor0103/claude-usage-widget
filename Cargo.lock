@@ -215,6 +215,7 @@ dependencies = [
  "cuw-core",
  "portable-pty",
  "serde_json",
+ "sha2",
  "thiserror 2.0.20",
  "time",
  "tokio",
@@ -2654,3 +2655,7 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[patch.unused]]
+name = "objc2-exception-helper"
+version = "0.1.1"

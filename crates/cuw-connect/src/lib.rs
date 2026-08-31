@@ -127,16 +127,15 @@ pub enum ConnectEvent {
 #[cfg(not(target_os = "macos"))]
 const NO_CREDENTIAL: &str = "claude auth login finished without writing a credential";
 
-/// macOS has a second explanation the user cannot guess: the CLI can keep the
-/// credential in the login Keychain instead of the scratch config dir, and the
-/// widget deliberately never reads Claude Code's own store (plan §5), so this is
-/// where the flow stops. The Keychain item is named after the config dir, so the
-/// one for this flow is distinct from the user's real login (plan §8 open 5).
+/// macOS has a second place to look before giving up: the CLI stores the
+/// credential in the login Keychain by default, under an item named after the
+/// config dir — so the scratch flow's item is distinct from the user's real
+/// login and safe to read and delete. This message only shows when that read
+/// failed too.
 #[cfg(target_os = "macos")]
 const NO_CREDENTIAL: &str = "claude auth login finished without writing a credential into the \
-     scratch config dir. On macOS the CLI may have stored it in the login Keychain instead — look \
-     for a `Claude Code-credentials-<8 hex>` item in Keychain Access. The widget does not read \
-     Claude Code's store, so there is nothing to recover here; report the CLI version.";
+     scratch config dir, and no matching `Claude Code-credentials-<8 hex>` item could be read \
+     from the login Keychain. Report the CLI version.";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
@@ -516,14 +515,27 @@ fn capture<F: Fn(ConnectEvent)>(
     emit: &F,
 ) -> bool {
     match watch {
-        Watch::CredentialFile => match read_credentials(cred_path) {
-            Some(c) => {
-                run.credential = Some(c);
-                emit(ConnectEvent::TokenCaptured);
-                true
+        Watch::CredentialFile => {
+            let found = read_credentials(cred_path);
+            // On macOS the CLI stores the credential in the login Keychain by
+            // default and writes no file; once the login has announced success,
+            // the scratch dir's own Keychain item is the place to look.
+            #[cfg(target_os = "macos")]
+            let found = found.or_else(|| {
+                let dir = cred_path.parent().unwrap_or(cred_path);
+                scan.login_seen
+                    .then(|| read_keychain_credentials(dir))
+                    .flatten()
+            });
+            match found {
+                Some(c) => {
+                    run.credential = Some(c);
+                    emit(ConnectEvent::TokenCaptured);
+                    true
+                }
+                None => false,
             }
-            None => false,
-        },
+        }
         Watch::TokenLine => match scan.cli_token() {
             Some(t) => {
                 run.cli_token = Some(t);
@@ -787,12 +799,15 @@ impl ScratchGuard {
     }
 
     /// Blank the credential file first, so even a dir that cannot be removed
-    /// holds no token.
+    /// holds no token. On macOS the credential usually lives in the Keychain
+    /// instead, under this dir's own item — take that too.
     fn overwrite_credential(&self) {
         let cred = self.path.join(".credentials.json");
         if cred.exists() {
             let _ = std::fs::write(&cred, "{}");
         }
+        #[cfg(target_os = "macos")]
+        scrub_keychain(&self.path);
     }
 
     /// One removal try. `true` once the dir is gone — which also marks the
@@ -829,6 +844,61 @@ fn read_credentials(path: &Path) -> Option<Credential> {
         tracing::trace!("credentials file not ready");
     }
     cred
+}
+
+/// The Keychain service the CLI keys a custom `CLAUDE_CONFIG_DIR`'s credential
+/// under: `Claude Code-credentials-` + the first 8 hex of SHA-256 over the dir
+/// path, exactly as the env var carries it. Pure and unconditional so the
+/// derivation is testable on every platform.
+pub fn keychain_service(config_dir: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(config_dir.as_os_str().as_encoded_bytes());
+    let mut suffix = String::with_capacity(8);
+    for b in &digest[..4] {
+        use std::fmt::Write;
+        let _ = write!(suffix, "{b:02x}");
+    }
+    format!("Claude Code-credentials-{suffix}")
+}
+
+/// The credential the CLI stored in the login Keychain for this scratch dir,
+/// if any. Same JSON as `.credentials.json`. The item's data is a token, so
+/// neither `security`'s output nor its failure is ever logged.
+#[cfg(target_os = "macos")]
+fn read_keychain_credentials(config_dir: &Path) -> Option<Credential> {
+    let out = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            &keychain_service(config_dir),
+            "-w",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    let v: Value = serde_json::from_str(text.trim()).ok()?;
+    parse_credentials_file(&v)
+}
+
+/// Delete the Keychain item the CLI may have created for `config_dir` — the
+/// Keychain half of scrubbing a scratch dir. Best effort; the item names only
+/// this one flow, never the user's real Claude Code login.
+#[cfg(target_os = "macos")]
+pub fn scrub_keychain(config_dir: &Path) {
+    let _ = std::process::Command::new("security")
+        .args([
+            "delete-generic-password",
+            "-s",
+            &keychain_service(config_dir),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Field-by-field parse of the CLI's `.credentials.json`; the shape is
@@ -919,6 +989,9 @@ struct OutputScan {
     /// The CLI token, once `setup-token` has finished printing one. Captured
     /// here rather than re-derived from `acc`, which is trimmed as it grows.
     token: Option<String>,
+    /// The login announced success. Gates the Keychain probe on macOS, so a
+    /// `security` process is not spawned on every output chunk.
+    login_seen: bool,
     url_sent: bool,
     await_sent: bool,
 }
@@ -943,6 +1016,9 @@ impl OutputScan {
         if !self.await_sent && clean.to_ascii_lowercase().contains("paste code") {
             emit(ConnectEvent::AwaitingCode);
             self.await_sent = true;
+        }
+        if !self.login_seen && self.acc.to_ascii_lowercase().contains("login successful") {
+            self.login_seen = true;
         }
 
         for seg in clean.split(['\n', '\r']) {
@@ -1572,6 +1648,22 @@ mod tests {
         assert_eq!(strip_ansi("paste \x1b[1mcode\x1b[m"), "paste code");
         assert_eq!(strip_ansi("one\x1b[5;1Htwo"), "one\ntwo");
         assert_eq!(strip_ansi("one\x08two"), "one\ntwo");
+    }
+
+    /// Pinned against an independently computed SHA-256: the CLI derives the
+    /// Keychain item from the config-dir string, and a drifted derivation would
+    /// silently miss the credential on every macOS connect.
+    #[test]
+    fn keychain_service_matches_the_cli_derivation() {
+        assert_eq!(
+            keychain_service(Path::new("/Users/alice/scratch-creds")),
+            "Claude Code-credentials-f3c4c8d0"
+        );
+        // Distinct dirs must never share an item.
+        assert_ne!(
+            keychain_service(Path::new("/tmp/a")),
+            keychain_service(Path::new("/tmp/b"))
+        );
     }
 
     #[test]

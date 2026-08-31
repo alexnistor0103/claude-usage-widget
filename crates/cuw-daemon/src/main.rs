@@ -162,6 +162,12 @@ fn sweep_scratch(root: &std::path::Path) {
     let mut count = 0usize;
     for entry in entries.flatten() {
         let path = entry.path();
+        // A crashed connect can also leave this dir's credential in the login
+        // Keychain; the item is named after the dir, so sweep it alongside.
+        #[cfg(target_os = "macos")]
+        if path.is_dir() {
+            cuw_connect::scrub_keychain(&path);
+        }
         // A stray file under the root is not a scratch dir; count only what went.
         let removed = if path.is_dir() {
             std::fs::remove_dir_all(&path).is_ok()
