@@ -9,7 +9,7 @@
 #   scripts/e2e-live.sh               # one live connect
 #   scripts/e2e-live.sh --reconnect   # + one reconnect
 #
-# Rules (see scripts/README.md): stops the overlay and cuw-daemon, never a
+# Rules: stops the overlay and cuw-daemon, never a
 # `claude` process; never touches ~/.claude; never reads a keyring value.
 #
 # The whole run is isolated (STATUS, 2026-08-31): its own data dir, its own
@@ -90,7 +90,7 @@ stop_widget() {
 
 # Builds a curl config on stdout. The bearer goes in here, never on the argv
 # where `ps` would show it to any process in the session (same trick as the
-# session shim, SWITCHER §4).
+# session shim).
 req_config() { # method path body_file|'' auth|noauth
     printf 'url = "http://127.0.0.1:%s%s"\n' "$port" "$2"
     printf 'request = "%s"\n' "$1"
@@ -458,7 +458,7 @@ fi
 # --- 9. Manual matrix + leak self-check --------------------------------------
 
 say ''
-say 'Manual overlay matrix (scripts/README.md has the full list):'
+say 'Manual overlay matrix:'
 say '  undocked: drag, Esc, settings persist, tray show/hide/quit, click-through'
 say '  docked:   pick Terminal.app or iTerm2, move/resize/minimise, space switch,'
 say '            close+reopen the terminal, Cmd-Tab absence, modal focus return'

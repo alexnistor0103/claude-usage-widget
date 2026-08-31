@@ -11,8 +11,7 @@
     Cargo.toml and Cargo.lock untouched.
 
     This is a compiler, not a Mac: it proves the macOS code typechecks, never
-    that it behaves. Runtime claims still need the manual matrix in
-    scripts/README.md.
+    that it behaves. Runtime claims still need a run on a real Mac.
 
 .EXAMPLE
     scripts/check-macos.ps1                      # workspace + overlay

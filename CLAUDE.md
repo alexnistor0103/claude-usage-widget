@@ -1,7 +1,7 @@
 # CLAUDE.md
 
-Guidance for working in this repo. The design lives in [plan.md](plan.md); read
-it before touching architecture. This file is conventions and commands.
+Guidance for working in this repo: conventions, commands, and the rules that
+the architecture depends on.
 
 ## What this is
 
@@ -22,7 +22,7 @@ localhost) and the Tauri `overlay` (renders percentages, never sees a token).
   runs on a thread inside the overlay.
 - `crates/cuw-launch` — `SessionLauncher` trait, the launch shims, per-platform
   spawn. Starts a terminal on a shim that redeems a nonce for a CLI token; the
-  crate itself never holds one. Design in [SWITCHER.md](SWITCHER.md).
+  crate itself never holds one.
 - `apps/overlay` — Tauri v2 shell. Detached from the workspace (own build).
 
 ## Commands
@@ -59,46 +59,44 @@ Stop a running daemon before building it:
 - No attribution, changelog, or author tags in comments.
 - Never reference AI, models, assistants, or how the code was produced —
   not in comments, commit messages, or identifiers.
-- A `(plan §N)` pointer to the design is fine and welcome.
 
 ## Rust conventions
 
 - Errors: `thiserror` in libraries, `anyhow` in binaries. No `unwrap`/`expect`
   on runtime paths; reserve them for provably-infallible setup.
 - Keep the endpoint client behind `UsageSource` and the token endpoint behind
-  `TokenRefresher` so an official API is a one-impl swap (plan §9).
+  `TokenRefresher` so an official API is a one-impl swap.
 - Match the surrounding style. Run `cargo fmt` and keep clippy clean.
 
 ## Hard rules
 
 - **Every unknown is a display state, not a panic.** `unavailable`,
-  `reconnect needed`, `detached` are first-class from M0 (plan §9).
+  `reconnect needed`, `detached` are first-class from M0.
 - **Never render stale data as fresh.** Non-200 / unexpected shape / parse
   failure → `unavailable`, never a wrong number; numbers held without a fresh
-  200 carry `stale: true` (plan §3).
+  200 carry `stale: true`.
 - **Tokens never leave the daemon** — not to the overlay, not to logs. Redact
-  on every path, including errors (plan §5).
+  on every path, including errors.
 - **Do not poll faster than one request per account per minute.** Jitter, and
-  back off hard on 429/5xx (plan §3).
+  back off hard on 429/5xx.
 - Parse the usage response defensively — never `serde` into required fields.
 - **Refresh discipline.** At most one token refresh per account per poll
   cycle; a rejected refresh (whitelisted OAuth error code) is terminal —
   `reconnect needed` and the poll task ends; any other 4xx is `Contract` and
-  backs off; never log a token-endpoint response body (plan §4).
+  backs off; never log a token-endpoint response body.
 - **Scratch dirs are daemon-owned.** The connect scratch dir lives under the
   data dir, is scrubbed on every exit path and swept at startup; never use
-  `%TEMP%` for it. Never run `claude auth logout` (plan §4).
+  `%TEMP%` for it. Never run `claude auth logout`.
 - **Log errors with `%e`, never `?e`.** `keyring::Error::BadEncoding` carries
-  the raw blob; `CredError`/`RefreshError` Debug output is not for logs
-  (plan §5).
+  the raw blob; `CredError`/`RefreshError` Debug output is not for logs.
 - **Docking never steals focus and ships default-off.** The tracker callback
   does filter + read + send only; the dock lock is never held across a Tauri
   window call; raw-HWND work runs on the main thread; re-apply
-  `WS_EX_TOOLWINDOW` after every show/hide/style call (plan §6).
+  `WS_EX_TOOLWINDOW` after every show/hide/style call.
 
 ## Ordering
 
 M1b (token source + refresh) is the blocker and goes first. M4 (docking) and
 M6 (polish) may be built alongside it — separate crates and files — but
 docking stays off by default until M3 + M1b has had a week of daily use.
-Enabling it is a settings flip, not a build. See plan.md §7.
+Enabling it is a settings flip, not a build.

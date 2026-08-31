@@ -6,7 +6,7 @@
 #   powershell -NoProfile -File scripts\e2e-live.ps1 -SkipLive   # no browser
 #   powershell -NoProfile -File scripts\e2e-live.ps1             # one live connect
 #
-# Rules (see scripts\README.md): stops the overlay and cuw-daemon, never a
+# Rules: stops the overlay and cuw-daemon, never a
 # `claude` process; never touches %USERPROFILE%\.claude; never reads a keyring
 # value.
 #
@@ -414,7 +414,7 @@ if ($down.Status -eq 204 -and $gone -and $pidGone) {
 # --- 9. Manual matrix + leak self-check --------------------------------------
 
 Say ''
-Say 'Manual overlay matrix (scripts\README.md has the full list):'
+Say 'Manual overlay matrix:'
 Say '  undocked: drag, Esc, settings persist, tray show/hide/quit, click-through'
 Say '  docked:   tray pick WT, move/resize/minimise, Win+D, virtual desktop,'
 Say '            close+reopen WT, Alt-Tab absence, modal focus return'
