@@ -363,10 +363,12 @@ pub fn overlay_hwnd(app: &AppHandle) -> Option<isize> {
 /// inline setters; elsewhere both queue FIFO on the same proxy.
 #[cfg(any(windows, target_os = "macos"))]
 pub fn restyle(app: &AppHandle) {
-    // Docked does NOT override the setting: with always-on-top off a docked
-    // widget sits at normal level and is re-raised above its target on every
-    // attach/restore/focus event instead, so other applications can cover it.
-    let topmost = always_on_top_setting(app);
+    // With always-on-top off a docked widget rides its target's z-order: it
+    // enters the topmost band only while the target holds the foreground (a
+    // background thread cannot lift a non-topmost window above the foreground
+    // window), and drops back to normal otherwise so other applications cover
+    // it. The always-on-top setting keeps it topmost unconditionally.
+    let topmost = always_on_top_setting(app) || dock::docked_and_focused(app);
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(h) = overlay_hwnd(&app2) {

@@ -5,8 +5,8 @@
 
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
-    HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, WS_EX_TOOLWINDOW,
+    HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    WS_EX_TOOLWINDOW,
 };
 
 use super::find::hwnd;
@@ -45,24 +45,6 @@ pub fn assert_topmost(h: isize) {
         SetWindowPos(
             hwnd(h),
             Some(HWND_TOPMOST),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        )
-    };
-}
-
-/// Raises the overlay to the top of the non-topmost band without activating —
-/// how a non-topmost docked widget gets above its target when that target
-/// comes forward. Main thread only.
-pub fn raise_to_top(h: isize) {
-    // SAFETY: z-order change only; no move, size or activation.
-    let _ = unsafe {
-        SetWindowPos(
-            hwnd(h),
-            Some(HWND_TOP),
             0,
             0,
             0,

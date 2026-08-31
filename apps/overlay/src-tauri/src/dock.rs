@@ -114,10 +114,17 @@ pub async fn dock_grant_accessibility(app: AppHandle) -> Result<(), String> {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-pub use imp::{ensure_started, focus_target, is_docked, replace_last, SharedDock};
+pub use imp::{
+    docked_and_focused, ensure_started, focus_target, is_docked, replace_last, SharedDock,
+};
 
 #[cfg(not(any(windows, target_os = "macos")))]
 pub fn is_docked(_app: &AppHandle) -> bool {
+    false
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn docked_and_focused(_app: &AppHandle) -> bool {
     false
 }
 
@@ -153,6 +160,11 @@ mod imp {
         state: DockState,
         last: Option<Bounds>,
         target_hwnd: Option<isize>,
+        /// True while the docked target holds the foreground. Drives the
+        /// topmost band: a docked widget floats above the target only while the
+        /// target is up front, and drops to the normal band otherwise so the
+        /// next application the user brings forward covers it.
+        target_focused: bool,
         /// Cached once on the main thread; the consumer never calls `window.hwnd()`.
         own_hwnd: Option<isize>,
         #[allow(dead_code)]
@@ -166,6 +178,7 @@ mod imp {
                 state: DockState::Undocked,
                 last: None,
                 target_hwnd: None,
+                target_focused: false,
                 own_hwnd: None,
                 consumer: None,
             }
@@ -304,6 +317,7 @@ mod imp {
                 h.detach().map_err(|e| format!("{e:#}"))?;
             }
             d.target_hwnd = None;
+            d.target_focused = false;
             d.last = None;
         }
         set_state(app, DockState::Undocked);
@@ -345,18 +359,22 @@ mod imp {
         }
     }
 
-    /// Put the overlay above its target. With always-on-top on that is the
-    /// floating level; off, it is a plain raise to the top of the normal band,
-    /// so the next application the user brings forward covers the widget.
-    fn raise_overlay(app: &AppHandle, own: isize) {
-        let topmost = crate::always_on_top_setting(app);
-        let _ = app.run_on_main_thread(move || {
-            if topmost {
-                style::assert_topmost(own);
-            } else {
-                style::raise_to_top(own);
-            }
-        });
+    /// `true` while a docked widget should float in the topmost band — i.e. its
+    /// target holds the foreground. `restyle` ORs this with the always-on-top
+    /// setting; a docked widget is only ever shown while the target is up front
+    /// (see the `Focused` handler), so this genuinely enters the topmost band
+    /// instead of a plain `HWND_TOP`, which a background thread cannot lift
+    /// above the foreground window.
+    pub fn docked_and_focused(app: &AppHandle) -> bool {
+        ctl(app)
+            .map(|d| {
+                let g = lock(&d);
+                matches!(
+                    g.state,
+                    DockState::Docked { .. } | DockState::Detached { .. }
+                ) && g.target_focused
+            })
+            .unwrap_or(false)
     }
 
     /// Re-run placement with the last bounds — after a settings change or a
@@ -430,11 +448,12 @@ mod imp {
             TrackerEvent::Attached(id) => {
                 let target = id.0;
                 let hwnd = resolve_target_hwnd(&target);
-                let own = {
+                {
                     let mut d = lock(&dock);
                     d.target_hwnd = hwnd;
-                    d.own_hwnd
-                };
+                    // Fresh dock: place the widget above the target straight away.
+                    d.target_focused = true;
+                }
                 set_state(
                     app,
                     DockState::Docked {
@@ -448,36 +467,33 @@ mod imp {
                 }) {
                     eprintln!("dock settings write failed: {e}");
                 }
-                if let Some(own) = own {
-                    raise_overlay(app, own);
-                }
+                // show_overlay's restyle enters the topmost band (docked +
+                // focused), so it must run after target_focused is set above.
                 show_overlay(app);
             }
             TrackerEvent::Bounds(b) => place(app, b),
             TrackerEvent::Minimized => hide_overlay(app),
             TrackerEvent::Restored => {
+                // A restored target is up front; float above it again.
+                lock(&dock).target_focused = true;
                 show_overlay(app);
-                if let Some(own) = lock(&dock).own_hwnd {
-                    raise_overlay(app, own);
-                }
             }
             TrackerEvent::Focused(focused) => {
-                if dock_settings(app).follow_focus {
-                    if focused {
-                        show_overlay(app);
-                    } else {
-                        hide_overlay(app);
-                    }
-                }
-                // A non-topmost docked widget rides its target's z-order: the
-                // target coming forward pulls the widget above it again.
+                // A docked widget shows only while its target holds the
+                // foreground; any other window taking it hides the widget.
+                // Set target_focused first so show_overlay's restyle enters the
+                // topmost band.
+                lock(&dock).target_focused = focused;
                 if focused {
-                    if let Some(own) = lock(&dock).own_hwnd {
-                        raise_overlay(app, own);
-                    }
+                    show_overlay(app);
+                } else {
+                    hide_overlay(app);
                 }
             }
             TrackerEvent::Lost => {
+                // Float the detached badge above the band so the user notices
+                // the widget lost its target rather than losing the widget.
+                lock(&dock).target_focused = true;
                 // Show first: a follow-focus hide would hide the detached badge.
                 show_overlay(app);
                 let target = {

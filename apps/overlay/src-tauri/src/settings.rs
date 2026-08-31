@@ -11,6 +11,12 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 const FILE_NAME: &str = "settings.json";
 
+/// Bumped when the meaning of a stored field changes, so `validate` can migrate
+/// an older file once. v2: `dock.follow_focus` no longer hides the widget (that
+/// is automatic while docked now) — it only re-docks to another allowed window
+/// on focus, so a v1 `true` (which meant "hide") must not carry over as that.
+const SCHEMA_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Settings {
@@ -124,7 +130,7 @@ pub struct SessionPatch {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: SCHEMA_VERSION,
             opacity: 0.85,
             compact: false,
             thresholds: Thresholds::default(),
@@ -147,7 +153,7 @@ impl Default for Thresholds {
 
 impl Default for Offset {
     fn default() -> Self {
-        Self { x: 8, y: 8 }
+        Self { x: 1, y: 42 }
     }
 }
 
@@ -238,6 +244,15 @@ pub fn save(app: &AppHandle, s: &Settings) -> Result<(), String> {
 }
 
 pub fn validate(mut s: Settings) -> Settings {
+    // A v1 file's follow_focus=true meant "hide when unfocused", which is now
+    // automatic while docked; the flag only re-docks between allowed windows.
+    // Clear it so the changed meaning does not surprise, then stamp the version.
+    if s.version < SCHEMA_VERSION {
+        if s.version < 2 {
+            s.dock.follow_focus = false;
+        }
+        s.version = SCHEMA_VERSION;
+    }
     // A docked widget is placed over its target and floats above it anyway,
     // so docking turns the global always-on-top off rather than fighting it.
     if s.dock.enabled {
@@ -537,6 +552,20 @@ mod tests {
         let mut undocked = Settings::default();
         undocked.always_on_top = true;
         assert!(validate(undocked).always_on_top);
+    }
+
+    #[test]
+    fn v1_follow_focus_is_cleared_and_the_version_stamped() {
+        // v1 true meant "hide when unfocused"; the meaning changed, so migrate.
+        let raw = r#"{"version":1,"dock":{"enabled":true,"follow_focus":true}}"#;
+        let s = validate(serde_json::from_str::<Settings>(raw).unwrap());
+        assert!(!s.dock.follow_focus);
+        assert_eq!(s.version, SCHEMA_VERSION);
+
+        // A current file keeps an explicit follow_focus untouched.
+        let raw2 = r#"{"version":2,"dock":{"enabled":true,"follow_focus":true}}"#;
+        let s2 = validate(serde_json::from_str::<Settings>(raw2).unwrap());
+        assert!(s2.dock.follow_focus);
     }
 
     #[test]

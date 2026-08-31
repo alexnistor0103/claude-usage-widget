@@ -47,15 +47,6 @@ pub fn assert_topmost(h: isize) {
     }
 }
 
-/// Brings the overlay to the front of its own (normal) level without
-/// activating anything — how a non-topmost docked widget gets above its
-/// target when that target comes forward. Main thread only.
-pub fn raise_to_top(h: isize) {
-    if let Some(window) = ns_window(h) {
-        window.orderFrontRegardless();
-    }
-}
-
 /// Hands focus back to the dock target after a modal closes. macOS activates
 /// applications rather than windows, so this activates the one that owns the
 /// given `CGWindowID`. Main thread only.
@@ -87,7 +78,6 @@ mod tests {
         set_tool_window(0, true);
         set_tool_window(0, false);
         assert_topmost(0);
-        raise_to_top(0);
     }
 
     #[test]

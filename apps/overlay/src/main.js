@@ -125,7 +125,7 @@ function defaultSettings() {
       enabled: false,
       remembered: null,
       corner: "top_right",
-      offset: { x: 8, y: 8 },
+      offset: { x: 1, y: 42 },
       inside: false,
       follow_focus: false,
       // Mirrors this platform's Rust default (settings.rs): window classes on
@@ -1140,7 +1140,7 @@ function openSettings() {
     track(refs.corner, "dock.corner");
     card.appendChild(fieldRow("Corner", refs.corner));
 
-    const off = (settings.dock && settings.dock.offset) || { x: 8, y: 8 };
+    const off = (settings.dock && settings.dock.offset) || { x: 1, y: 42 };
     refs.offx = numberInput(off.x, -500, 500);
     refs.offy = numberInput(off.y, -500, 500);
     track(refs.offx, "dock.offset");
@@ -1157,7 +1157,13 @@ function openSettings() {
 
     refs.follow = checkboxInput(settings.dock && settings.dock.follow_focus);
     track(refs.follow, "dock.follow_focus");
-    card.appendChild(fieldRow("Hide when target unfocused", refs.follow));
+    card.appendChild(
+      fieldRow(
+        "Follow focus between windows",
+        refs.follow,
+        "A docked widget always hides when its target is unfocused; this also re-docks it to another allowed window that takes focus.",
+      ),
+    );
 
     const pick = makeButton("Pick window…", "");
     pick.onclick = () => {
