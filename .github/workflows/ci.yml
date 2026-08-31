@@ -28,9 +28,9 @@ jobs:
       matrix:
         os: [windows-latest, macos-14]
     env:
-      # Nothing in CI may reach a real data dir or a real credential, whatever a
-      # future test does (STATUS, 2026-08-31).
-      CUW_DATA_DIR: ${{ runner.temp }}/cuw-data
+      # Nothing in CI may reach a real credential, whatever a future test does
+      # (STATUS, 2026-08-31). The data dir joins per step: the `runner` context
+      # does not exist at job level and invalidates the whole workflow file.
       CUW_KEYRING_SERVICE: com.local.cuw-ci
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +49,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+        env:
+          CUW_DATA_DIR: ${{ runner.temp }}/cuw-data
       # The root workspace does not contain the overlay, so it needs its own
       # invocation. No bundling: that wants an installer toolchain and a release
       # daemon to package (scripts/build-release.ps1 / .sh).
@@ -61,6 +63,8 @@ jobs:
       - name: cargo test (overlay)
         working-directory: apps/overlay/src-tauri
         run: cargo test
+        env:
+          CUW_DATA_DIR: ${{ runner.temp }}/cuw-data
 
   macos-cross:
     # The safety net the macOS work was written against: `cargo check` never
