@@ -363,9 +363,10 @@ pub fn overlay_hwnd(app: &AppHandle) -> Option<isize> {
 /// inline setters; elsewhere both queue FIFO on the same proxy.
 #[cfg(any(windows, target_os = "macos"))]
 pub fn restyle(app: &AppHandle) {
-    // Docked overrides the setting: a widget pinned to a window's corner must
-    // sit above that window or it is invisible.
-    let topmost = always_on_top_setting(app) || dock::is_docked(app);
+    // Docked does NOT override the setting: with always-on-top off a docked
+    // widget sits at normal level and is re-raised above its target on every
+    // attach/restore/focus event instead, so other applications can cover it.
+    let topmost = always_on_top_setting(app);
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(h) = overlay_hwnd(&app2) {
@@ -400,7 +401,7 @@ pub fn apply_style_from_settings(app: &AppHandle) {
         if let Some(w) = app2.get_webview_window("main") {
             let _ = w.set_ignore_cursor_events(click_through);
             let _ = w.set_focusable(!(click_through || docked));
-            let _ = w.set_always_on_top(always_on_top || docked);
+            let _ = w.set_always_on_top(always_on_top);
         }
         restyle(&app2);
     });

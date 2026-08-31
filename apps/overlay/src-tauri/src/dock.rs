@@ -251,7 +251,6 @@ mod imp {
         let _ = app.run_on_main_thread(move || {
             if let Some(w) = app2.get_webview_window("main") {
                 let _ = w.set_focusable(false);
-                let _ = w.set_always_on_top(true);
             }
             crate::restyle(&app2);
         });
@@ -346,6 +345,20 @@ mod imp {
         }
     }
 
+    /// Put the overlay above its target. With always-on-top on that is the
+    /// floating level; off, it is a plain raise to the top of the normal band,
+    /// so the next application the user brings forward covers the widget.
+    fn raise_overlay(app: &AppHandle, own: isize) {
+        let topmost = crate::always_on_top_setting(app);
+        let _ = app.run_on_main_thread(move || {
+            if topmost {
+                style::assert_topmost(own);
+            } else {
+                style::raise_to_top(own);
+            }
+        });
+    }
+
     /// Re-run placement with the last bounds — after a settings change or a
     /// window resize. Only while docked and visible; hide/minimise fire
     /// `Resized(0×0)` and must not move anything.
@@ -436,7 +449,7 @@ mod imp {
                     eprintln!("dock settings write failed: {e}");
                 }
                 if let Some(own) = own {
-                    let _ = app.run_on_main_thread(move || style::assert_topmost(own));
+                    raise_overlay(app, own);
                 }
                 show_overlay(app);
             }
@@ -445,7 +458,7 @@ mod imp {
             TrackerEvent::Restored => {
                 show_overlay(app);
                 if let Some(own) = lock(&dock).own_hwnd {
-                    let _ = app.run_on_main_thread(move || style::assert_topmost(own));
+                    raise_overlay(app, own);
                 }
             }
             TrackerEvent::Focused(focused) => {
@@ -454,6 +467,13 @@ mod imp {
                         show_overlay(app);
                     } else {
                         hide_overlay(app);
+                    }
+                }
+                // A non-topmost docked widget rides its target's z-order: the
+                // target coming forward pulls the widget above it again.
+                if focused {
+                    if let Some(own) = lock(&dock).own_hwnd {
+                        raise_overlay(app, own);
                     }
                 }
             }
