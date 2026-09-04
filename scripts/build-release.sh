@@ -79,11 +79,14 @@ fi
 # lands in Contents/Resources, which is exactly where the overlay's
 # `bundled_daemon` looks - so the resource needs no copy afterwards and a .dmg
 # built in the same run carries a complete app.
+# Updater artefacts (the .app.tar.gz and its .sig) need the minisign key;
+# without it the build is a plain .dmg that the in-app updater ignores.
+if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then updater=true; else updater=false; fi
 echo '== cargo tauri build =='
 (
     cd "$overlay" && cargo tauri build \
         ${universal:+--target universal-apple-darwin} --config \
-        '{"bundle":{"resources":{"../../../target/release/cuw-daemon":"cuw-daemon"}}}'
+        '{"bundle":{"createUpdaterArtifacts":'"$updater"',"resources":{"../../../target/release/cuw-daemon":"cuw-daemon"}}}'
 )
 
 # The un-bundled binary has no Resources dir, so it needs the sibling copy.
@@ -108,3 +111,6 @@ done
 if [ -z "$found_dmg" ]; then
     echo "  installer   : (no .dmg; the bundler needs hdiutil)"
 fi
+for sig in "$release"/bundle/macos/*.app.tar.gz.sig; do
+    [ -f "$sig" ] && echo "  updater sig : $sig"
+done

@@ -483,12 +483,14 @@ function setDock(payload) {
 // unauthenticated GitHub request that must not be worth rate-limiting.
 const UPDATE_EVERY_MS = 6 * 60 * 60 * 1000;
 
-// The release page for the version last offered; null when nothing is offered.
-let updateUrl = null;
+// "idle" shows the offer, "busy" the progress bar, "failed" the fallback link.
+let updateState = "idle";
+let updateLatest = null;
 
 // Rust answers with a value for every outcome — offline, rate-limited, no
 // release published — so "no update" is the only failure the UI has.
 async function checkUpdate() {
+  if (updateState !== "idle") return;
   const btn = document.getElementById("update");
   if (!btn) return;
   let info = null;
@@ -498,10 +500,59 @@ async function checkUpdate() {
     return; // plain browser — leave the pill hidden
   }
   const ok = info && info.available === true && typeof info.latest === "string";
-  updateUrl = ok && typeof info.url === "string" ? info.url : null;
+  updateLatest = ok ? info.latest : null;
   btn.hidden = !ok;
+  btn.classList.remove("busy", "failed");
+  btn.style.removeProperty("--p");
   btn.textContent = ok ? `Update v${info.latest}` : "";
-  btn.title = ok ? "Open the release page" : "";
+  btn.title = ok ? "Download and install, then relaunch" : "";
+}
+
+// One click does the whole thing: download with a bar, install, relaunch.
+// The process ends on success, so only the failure path ever comes back.
+async function installUpdate() {
+  const btn = document.getElementById("update");
+  if (!btn || updateState === "busy") return;
+  if (updateState === "failed") {
+    invoke("open_release").catch(() => {});
+    return;
+  }
+  updateState = "busy";
+  btn.classList.add("busy");
+  btn.classList.remove("failed");
+  btn.title = "";
+  renderUpdateProgress(btn, { phase: "download", downloaded: 0, total: null });
+  try {
+    await invoke("install_update");
+  } catch (e) {
+    updateState = "failed";
+    btn.classList.remove("busy");
+    btn.classList.add("failed");
+    btn.style.removeProperty("--p");
+    btn.textContent = "Update failed — open release page";
+    btn.title = String(e && e.message ? e.message : e);
+  }
+}
+
+function renderUpdateProgress(btn, p) {
+  if (!p || typeof p.phase !== "string") return;
+  if (p.phase === "download") {
+    const total = Number(p.total);
+    const done = Number(p.downloaded) || 0;
+    if (Number.isFinite(total) && total > 0) {
+      const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+      btn.style.setProperty("--p", `${pct}%`);
+      btn.textContent = `Downloading ${pct}%`;
+    } else {
+      btn.style.setProperty("--p", "0%");
+      btn.textContent = done > 0 ? `Downloading ${(done / 1048576).toFixed(1)} MB` : "Downloading…";
+    }
+  } else if (p.phase === "install") {
+    btn.style.setProperty("--p", "100%");
+    btn.textContent = `Installing v${updateLatest || ""}…`;
+  } else if (p.phase === "restart") {
+    btn.textContent = "Restarting…";
+  }
 }
 
 // --- Modals -----------------------------------------------------------------
@@ -948,9 +999,7 @@ document.getElementById("gear").addEventListener("click", () => {
   invoke("open_settings").catch(() => {});
 });
 
-document.getElementById("update").addEventListener("click", () => {
-  if (updateUrl) invoke("open_release", { url: updateUrl }).catch(() => {});
-});
+document.getElementById("update").addEventListener("click", installUpdate);
 
 document.getElementById("dock").addEventListener("click", () => {
   const docked = dockState === "docked" || dockState === "detached";
@@ -1022,6 +1071,10 @@ function clearStatus() {
     if (Number.isFinite(o)) document.documentElement.style.setProperty("--bg-alpha", String(o));
   });
   listen("dock-state", (e) => setDock(e && e.payload));
+  listen("update-progress", (e) => {
+    const btn = document.getElementById("update");
+    if (btn && updateState === "busy") renderUpdateProgress(btn, e && e.payload);
+  });
   invoke("dock_state")
     .then(setDock)
     .catch(() => {});

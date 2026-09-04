@@ -81,6 +81,21 @@ body {
   color: var(--fg);
 }
 
+/* The pill becomes its own download bar: --p is the filled share. */
+.pill.busy {
+  --p: 0%;
+  min-width: 120px;
+  text-align: left;
+  color: var(--fg);
+  cursor: progress;
+  background: linear-gradient(to right, var(--bar) var(--p), rgba(255, 255, 255, 0.08) var(--p));
+  transition: background 0.15s linear;
+}
+
+.pill.failed {
+  color: var(--warn);
+}
+
 .row {
   padding: 6px 0;
 }

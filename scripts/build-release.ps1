@@ -29,7 +29,11 @@ if (-not (Test-Path $daemonExe)) { throw "missing $daemonExe" }
 Write-Host '== cargo tauri build =='
 # Inline JSON does not survive PowerShell 5.1's native-arg quoting; --config
 # also takes a path, so the resource declaration goes through a scratch file.
-$resources = '{"bundle":{"resources":{"../../../target/release/cuw-daemon.exe":"cuw-daemon.exe"}}}'
+# Updater artefacts (the .sig next to the installer) need the minisign key;
+# without it the build is a plain installer that the in-app updater ignores.
+$signed = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)
+$updater = if ($signed) { 'true' } else { 'false' }
+$resources = '{"bundle":{"createUpdaterArtifacts":' + $updater + ',"resources":{"../../../target/release/cuw-daemon.exe":"cuw-daemon.exe"}}}'
 $configPath = Join-Path ([IO.Path]::GetTempPath()) 'cuw-bundle-resources.json'
 [IO.File]::WriteAllText($configPath, $resources)
 Push-Location (Join-Path $root 'apps\overlay\src-tauri')
@@ -49,6 +53,7 @@ Write-Host ("  daemon exe  : {0}" -f (Join-Path $overlayRelease 'cuw-daemon.exe'
 $nsis = Join-Path $overlayRelease 'bundle\nsis'
 if (Test-Path $nsis) {
     Get-ChildItem $nsis -Filter *.exe | ForEach-Object { Write-Host ("  installer   : {0}" -f $_.FullName) }
+    Get-ChildItem $nsis -Filter *.sig | ForEach-Object { Write-Host ("  updater sig : {0}" -f $_.FullName) }
 } else {
     Write-Host ("  installer   : (none under {0})" -f $nsis)
 }

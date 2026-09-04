@@ -637,29 +637,78 @@ function buildAbout(pane) {
       .catch(() => {});
   }
   const result = el("span", "note");
-  const open = button("Open release page", "small", () => {});
+  const bar = el("div", "bar");
+  const fill = el("div", "fill");
+  bar.appendChild(fill);
+  bar.hidden = true;
+  const open = button("Open release page", "small", () => {
+    invoke("open_release").catch(() => {});
+  });
   open.hidden = true;
+  let latest = null;
+  let busy = false;
   const check = button("Check for updates", "", async () => {
+    if (busy) return;
     check.disabled = true;
     result.textContent = "Checking…";
     open.hidden = true;
     try {
       const info = await invoke("check_update");
       const ok = info && info.available === true && typeof info.latest === "string";
+      latest = ok ? info.latest : null;
       result.textContent = ok ? `Version ${info.latest} is available.` : "You are up to date.";
-      if (ok && typeof info.url === "string") {
-        open.hidden = false;
-        open.onclick = () => invoke("open_release", { url: info.url }).catch(() => {});
-      }
+      install.hidden = !ok;
     } catch {
       result.textContent = "Could not check right now.";
     } finally {
       check.disabled = false;
     }
   });
+  // One click: download with a bar, install, relaunch. Success ends the
+  // process, so only a failure ever lands back here.
+  const install = button("Update now", "primary", async () => {
+    if (busy) return;
+    busy = true;
+    install.disabled = true;
+    check.disabled = true;
+    bar.hidden = false;
+    fill.style.width = "0%";
+    result.textContent = "Downloading…";
+    try {
+      await invoke("install_update");
+    } catch (e) {
+      busy = false;
+      install.disabled = false;
+      check.disabled = false;
+      bar.hidden = true;
+      result.textContent = `Update failed: ${e && e.message ? e.message : e}`;
+      open.hidden = false;
+    }
+  });
+  install.hidden = true;
+  listen("update-progress", (e) => {
+    const p = e && e.payload;
+    if (!busy || !p) return;
+    if (p.phase === "download") {
+      const total = Number(p.total);
+      const done = Number(p.downloaded) || 0;
+      if (Number.isFinite(total) && total > 0) {
+        const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+        fill.style.width = `${pct}%`;
+        result.textContent = `Downloading ${pct}%`;
+      } else {
+        result.textContent = done > 0 ? `Downloading ${(done / 1048576).toFixed(1)} MB` : "Downloading…";
+      }
+    } else if (p.phase === "install") {
+      fill.style.width = "100%";
+      result.textContent = `Installing version ${latest || ""}…`;
+    } else if (p.phase === "restart") {
+      result.textContent = "Restarting…";
+    }
+  });
   const update = el("div", "update");
-  update.append(check, result, open);
-  box.append(el("div", "app", "Claude Usage Widget"), ver, update);
+  update.append(check, install, result, open);
+  box.append(el("div", "app", "Claude Usage Widget"), ver, update, bar);
 
   const keys = el("div", "text");
   keys.append(

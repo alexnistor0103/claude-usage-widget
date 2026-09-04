@@ -89,6 +89,11 @@ Stop a running daemon before building it:
   `%TEMP%` for it. Never run `claude auth logout`.
 - **Log errors with `%e`, never `?e`.** `keyring::Error::BadEncoding` carries
   the raw blob; `CredError`/`RefreshError` Debug output is not for logs.
+- **Updates are signed.** The updater pubkey lives in `tauri.conf.json`; the
+  matching minisign private key is the `TAURI_SIGNING_PRIVATE_KEY` repo secret
+  (local copy: `~/.tauri/cuw.key`, never in the repo). A tag build without it
+  still publishes installers, but no `latest.json`, so nothing self-updates to
+  it. Release assets keep the names `scripts/release-manifest.sh` writes.
 - **Docking never steals focus and ships default-off.** The tracker callback
   does filter + read + send only; the dock lock is never held across a Tauri
   window call; raw-HWND work runs on the main thread; re-apply

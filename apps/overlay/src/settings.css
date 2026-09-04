@@ -551,6 +551,23 @@ input[type="color"] {
   gap: 10px;
 }
 
+.about .bar {
+  margin-top: 10px;
+  height: 6px;
+  max-width: 360px;
+  border-radius: 3px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.about .bar .fill {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.15s linear;
+}
+
 kbd {
   padding: 1px 5px;
   border: 1px solid var(--line);

@@ -16,6 +16,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,15 @@ const DAEMON_PORT: u16 = 8787;
 /// The daemon process we spawned, kept so `stop_daemon` can kill it as a last
 /// resort. `None` when the daemon was already running or start failed.
 pub struct DaemonChild(pub Mutex<Option<Child>>);
+
+/// Set while an update is being installed: the web layer retries
+/// `start_daemon` whenever the port goes quiet, and the daemon just stopped
+/// for the installer must not come back under it (update.rs).
+static UPDATING: AtomicBool = AtomicBool::new(false);
+
+pub fn set_updating(on: bool) {
+    UPDATING.store(on, Ordering::SeqCst);
+}
 
 /// Read the daemon's localhost bearer from its `0600` file. Same path the daemon
 /// derives (`directories` with the `com.local.cuw` triple, then `bearer.token`).
@@ -52,7 +62,7 @@ fn bearer_token() -> Result<String, String> {
 /// can call this freely on every reconnect attempt (M3.6).
 #[tauri::command]
 fn start_daemon(state: State<DaemonChild>) -> Result<(), String> {
-    if daemon_is_up() {
+    if daemon_is_up() || UPDATING.load(Ordering::SeqCst) {
         return Ok(());
     }
     let child = spawn_daemon().map_err(|e| e.to_string())?;
@@ -560,6 +570,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let handle = app.handle().clone();
             let s = settings::load(&handle);
@@ -570,6 +581,7 @@ pub fn run() {
             app.manage(Mutex::new(s));
             app.manage(DaemonChild(Mutex::new(None)));
             app.manage(popover::Popover::default());
+            app.manage(update::Pending::default());
             // Out of the Dock and out of Cmd-Tab is an *application* property on
             // macOS, not a per-window flag the way `WS_EX_TOOLWINDOW` is — so it
             // is set once here and never per window (plan §6). The bundle's
@@ -653,6 +665,7 @@ pub fn run() {
             settings_window::close_settings,
             open_url,
             update::check_update,
+            update::install_update,
             update::open_release,
             settings::get_settings,
             settings::set_settings,
