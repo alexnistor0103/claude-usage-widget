@@ -1,6 +1,8 @@
 # Installer builds for handing out: the NSIS .exe from Windows and a universal
 # (x86_64 + arm64) .dmg from macOS, via the same scripts a laptop would use.
-# Manual trigger only — unsigned artefacts, so nothing publishes itself.
+# A manual run only leaves the artefacts on the run; a `v*` tag also attaches
+# them to a GitHub release under that tag, which is what the in-app update
+# check reads (update.rs).
 name: release
 
 on:
@@ -84,3 +86,23 @@ jobs:
           name: macos-installer
           path: apps/overlay/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
+
+  publish:
+    name: github release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: installers
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            installers/*.exe
+            installers/*.dmg
+          fail_on_unmatched_files: true
+          generate_release_notes: true
