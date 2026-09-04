@@ -47,35 +47,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ±20 % so many clients (or many restarts) don't retry in lockstep.
 const jitter = (ms) => ms * (0.8 + Math.random() * 0.4);
 
-function isWindows() {
-  return navigator.userAgent.includes("Windows");
-}
-
-function isMac() {
-  return navigator.userAgent.includes("Mac OS X");
-}
-
-// Docking exists on Windows and macOS only (plan §6); everywhere else the dock
-// commands answer with an error and the UI must not offer them.
-function dockingSupported() {
-  return isWindows() || isMac();
-}
-
-// --- Tauri bridge (safe no-ops outside the shell) ---------------------------
-
-function invoke(cmd, args) {
-  const t = window.__TAURI__;
-  if (t && t.core && typeof t.core.invoke === "function") {
-    return t.core.invoke(cmd, args);
-  }
-  return Promise.reject(new Error("tauri unavailable"));
-}
-
-function listen(name, cb) {
-  const t = window.__TAURI__;
-  if (t && t.event && typeof t.event.listen === "function") {
-    t.event.listen(name, cb).catch(() => {});
-  }
+// Menu bar mode: no floating widget, the tray icon opens this view as a
+// popover. There is nothing to dock or drag.
+function menuBarMode() {
+  return settings.mode !== "widget";
 }
 
 async function initBearer() {
@@ -108,49 +83,6 @@ async function tryStartDaemon() {
 
 // --- Settings ---------------------------------------------------------------
 
-// Mirror of the Rust defaults (settings.rs); used until get_settings answers
-// and forever in a plain browser.
-function defaultSettings() {
-  return {
-    version: 1,
-    opacity: 0.85,
-    compact: false,
-    thresholds: { warn: 75, crit: 90 },
-    autostart: false,
-    click_through: false,
-    always_on_top: false,
-    show_scoped: true,
-    colors: {},
-    dock: {
-      enabled: false,
-      remembered: null,
-      corner: "top_right",
-      offset: { x: 1, y: 42 },
-      inside: false,
-      follow_focus: false,
-      // Mirrors this platform's Rust default (settings.rs): window classes on
-      // Windows, application bundle ids on macOS.
-      allow: isMac()
-        ? [
-            { class: "com.apple.Terminal", exe: null },
-            { class: "com.googlecode.iterm2", exe: null },
-            { class: "com.microsoft.VSCode", exe: null },
-            { class: "com.anthropic.claudefordesktop", exe: null },
-          ]
-        : [
-            { class: "CASCADIA_HOSTING_WINDOW_CLASS", exe: null },
-            { class: "ConsoleWindowClass", exe: null },
-            { class: "org.wezfurlong.wezterm", exe: null },
-            { class: "Alacritty", exe: null },
-            { class: "Chrome_WidgetWin_1", exe: "Code.exe" },
-            { class: "Chrome_WidgetWin_1", exe: "Hyper.exe" },
-          ],
-      show_accessibility_hint: true,
-    },
-    session: { terminal: [], cwd: "" },
-  };
-}
-
 let settings = defaultSettings();
 
 function applySettings() {
@@ -158,8 +90,9 @@ function applySettings() {
   document.documentElement.style.setProperty("--bg-alpha", String(o));
   document.body.classList.toggle("compact", settings.compact === true);
   clickThrough = settings.click_through === true;
+  document.body.classList.toggle("popover", menuBarMode());
   const dockBtn = document.getElementById("dock");
-  if (dockBtn) dockBtn.hidden = !dockingSupported();
+  if (dockBtn) dockBtn.hidden = !dockingSupported() || menuBarMode();
 }
 
 // --- HTTP -------------------------------------------------------------------
@@ -264,11 +197,8 @@ async function streamLoop() {
 
 // --- Rendering --------------------------------------------------------------
 
-const palette = ["#6ea8fe", "#7ee0a0", "#f5c96b", "#c79bff", "#ff9b85"];
-
 function colorFor(id, index) {
-  const c = settings.colors && settings.colors[id];
-  return typeof c === "string" ? c : palette[index % palette.length];
+  return paletteColor(settings, id, index);
 }
 
 function level(pct) {
@@ -580,25 +510,16 @@ async function checkUpdate() {
 // while a modal must not be dismissed (a connect flow in progress).
 let modalCancel = null;
 
-// Settings-panel liveness: a new modal displaces the panel, so buildModal
-// resets these.
-let panelOpen = false;
-let panelRefs = null;
-
 function closeModal() {
   modalRoot.replaceChildren();
   modalRoot.classList.remove("open");
   modalCancel = null;
-  panelOpen = false;
-  panelRefs = null;
   // Hand the window style back to settings/docking (M6.3).
   invoke("modal_interactive", { on: false }).catch(() => {});
 }
 
 function buildModal(title) {
   modalCancel = null;
-  panelOpen = false;
-  panelRefs = null;
   // A click-through or non-focusable window can't be clicked or typed into;
   // modals need both for as long as they are open (M6.3).
   invoke("modal_interactive", { on: true }).catch(() => {});
@@ -988,443 +909,6 @@ async function startSession(id, label) {
   }
 }
 
-// --- Settings panel ---------------------------------------------------------
-
-function fieldRow(labelText, control, noteText) {
-  const f = document.createElement("div");
-  f.className = "field";
-  const l = document.createElement("span");
-  l.className = "flabel";
-  l.textContent = labelText;
-  f.append(l, control);
-  if (noteText) {
-    const n = document.createElement("span");
-    n.className = "note";
-    n.textContent = noteText;
-    f.appendChild(n);
-  }
-  return f;
-}
-
-function checkboxInput(checked) {
-  const c = document.createElement("input");
-  c.type = "checkbox";
-  c.checked = checked === true;
-  return c;
-}
-
-function numberInput(value, min, max) {
-  const n = document.createElement("input");
-  n.type = "number";
-  n.min = String(min);
-  n.max = String(max);
-  n.value = Number.isFinite(value) ? String(value) : "";
-  return n;
-}
-
-function allowText(allow) {
-  return (Array.isArray(allow) ? allow : [])
-    .filter((a) => a && typeof a.class === "string")
-    .map((a) => (a.exe ? `${a.class}|${a.exe}` : a.class))
-    .join("\n");
-}
-
-function parseAllow(text) {
-  const out = [];
-  for (const raw of String(text).split("\n")) {
-    const line = raw.trim();
-    if (!line) continue;
-    const bar = line.indexOf("|");
-    const cls = (bar >= 0 ? line.slice(0, bar) : line).trim();
-    const exe = bar >= 0 ? line.slice(bar + 1).trim() : "";
-    if (cls) out.push({ class: cls, exe: exe || null });
-  }
-  return out;
-}
-
-// A terminal override is argv, one argument per line, never re-split (SWITCHER
-// §5) — so a path with spaces survives the round trip through the box.
-function argvText(argv) {
-  return (Array.isArray(argv) ? argv : []).filter((a) => typeof a === "string").join("\n");
-}
-
-// macOS docking runs on a permission-free poll and only gets smoother when
-// Accessibility is granted (plan §6), so this is one honest line the user can
-// dismiss for good — never a blocker, and never shown where there is no such
-// permission (Rust answers `applicable: false` there). The container is
-// returned empty and filled once the command answers.
-function accessibilityHint() {
-  const box = document.createElement("div");
-  if (settings.dock && settings.dock.show_accessibility_hint === false) return box;
-  invoke("dock_accessibility")
-    .then((a) => {
-      if (!a || a.applicable !== true || a.trusted === true) return;
-      const line = document.createElement("div");
-      line.className = "note block";
-      line.textContent = "Docking works now. Grant Accessibility for smoother tracking.";
-      const grant = makeButton("Grant…", "");
-      grant.onclick = () => {
-        // The system dialog, not a System Settings link: open_url's allowlist
-        // is https-only and stays that way.
-        invoke("dock_grant_accessibility").catch(() => {});
-      };
-      const dismiss = makeButton("Dismiss", "");
-      dismiss.onclick = () => {
-        box.replaceChildren();
-        // Persisted on the spot rather than on Save: Save only sends the
-        // fields the user edited, and this is not one of them.
-        invoke("set_settings", {
-          patch: { dock: { show_accessibility_hint: false } },
-        }).catch(() => {});
-      };
-      const row = document.createElement("div");
-      row.className = "field";
-      row.append(grant, dismiss);
-      box.append(line, row);
-    })
-    .catch(() => {});
-  return box;
-}
-
-function parseArgv(text) {
-  return String(text)
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
-}
-
-function openSettings() {
-  if (panelOpen) return;
-  const card = buildModal("Settings");
-  card.classList.add("settings");
-  panelOpen = true;
-
-  // Paths the user actually edited; Save sends only these, so a Rust-side
-  // change while the panel is open (an Attached event, a tray toggle) is never
-  // reverted by an untouched field (M6.1).
-  const touched = new Set();
-  const refs = { touched, colorInputs: new Map() };
-  const track = (el, path) => {
-    const mark = () => touched.add(path);
-    el.addEventListener("input", mark);
-    el.addEventListener("change", mark);
-  };
-  const section = (title) => {
-    const h = document.createElement("div");
-    h.className = "section-title";
-    h.textContent = title;
-    card.appendChild(h);
-  };
-
-  // -- Docking (Windows and macOS; the tracker exists nowhere else) --
-  if (dockingSupported()) {
-    section("Docking");
-    card.appendChild(accessibilityHint());
-    refs.dockEnabled = checkboxInput(settings.dock && settings.dock.enabled);
-    track(refs.dockEnabled, "dock.enabled");
-    card.appendChild(fieldRow("Enabled", refs.dockEnabled));
-
-    refs.corner = document.createElement("select");
-    for (const [v, t] of [
-      ["top_left", "Top left"],
-      ["top_right", "Top right"],
-      ["bottom_left", "Bottom left"],
-      ["bottom_right", "Bottom right"],
-    ]) {
-      const o = document.createElement("option");
-      o.value = v;
-      o.textContent = t;
-      refs.corner.appendChild(o);
-    }
-    refs.corner.value = (settings.dock && settings.dock.corner) || "top_right";
-    track(refs.corner, "dock.corner");
-    card.appendChild(fieldRow("Corner", refs.corner));
-
-    const off = (settings.dock && settings.dock.offset) || { x: 1, y: 42 };
-    refs.offx = numberInput(off.x, -500, 500);
-    refs.offy = numberInput(off.y, -500, 500);
-    track(refs.offx, "dock.offset");
-    track(refs.offy, "dock.offset");
-    const offWrap = document.createElement("span");
-    offWrap.append(refs.offx, refs.offy);
-    offWrap.style.display = "flex";
-    offWrap.style.gap = "4px";
-    card.appendChild(fieldRow("Offset x/y", offWrap));
-
-    refs.inside = checkboxInput(settings.dock && settings.dock.inside);
-    track(refs.inside, "dock.inside");
-    card.appendChild(fieldRow("Inside the window", refs.inside));
-
-    refs.follow = checkboxInput(settings.dock && settings.dock.follow_focus);
-    track(refs.follow, "dock.follow_focus");
-    card.appendChild(
-      fieldRow(
-        "Follow focus between windows",
-        refs.follow,
-        "A docked widget always hides when its target is unfocused; this also re-docks it to another allowed window that takes focus.",
-      ),
-    );
-
-    const pick = makeButton("Pick window…", "");
-    pick.onclick = () => {
-      // The guards against picking our own window live in Rust (plan §6).
-      closeModal();
-      invoke("dock_pick").catch(() => {});
-    };
-    card.appendChild(fieldRow("Target", pick));
-
-    refs.remembered = document.createElement("span");
-    refs.remembered.className = "readonly";
-    refs.remembered.textContent = (settings.dock && settings.dock.remembered) || "(none)";
-    card.appendChild(fieldRow("Remembered", refs.remembered));
-
-    refs.allow = document.createElement("textarea");
-    refs.allow.value = allowText(settings.dock && settings.dock.allow);
-    refs.allow.spellcheck = false;
-    track(refs.allow, "dock.allow");
-    const allowField = document.createElement("div");
-    allowField.className = "field";
-    const allowLabel = document.createElement("span");
-    allowLabel.className = "flabel";
-    allowLabel.textContent = isMac()
-      ? "Allowed apps (bundle id per line)"
-      : "Allowed windows (class|exe per line)";
-    allowField.append(allowLabel);
-    card.append(allowField, refs.allow);
-  }
-
-  // -- Appearance --
-  section("Appearance");
-  refs.opacity = document.createElement("input");
-  refs.opacity.type = "range";
-  refs.opacity.min = "0.2";
-  refs.opacity.max = "1";
-  refs.opacity.step = "0.01";
-  refs.opacity.value = String(Number.isFinite(settings.opacity) ? settings.opacity : 0.85);
-  track(refs.opacity, "opacity");
-  refs.opacity.addEventListener("input", () => {
-    // Live preview only; Cancel reverts via applySettings().
-    document.documentElement.style.setProperty("--bg-alpha", refs.opacity.value);
-  });
-  card.appendChild(fieldRow("Opacity", refs.opacity));
-
-  refs.compact = checkboxInput(settings.compact);
-  track(refs.compact, "compact");
-  card.appendChild(fieldRow("Compact (labels only)", refs.compact));
-
-  refs.showScoped = checkboxInput(settings.show_scoped);
-  track(refs.showScoped, "show_scoped");
-  card.appendChild(fieldRow("Show per-model limits", refs.showScoped));
-
-  const th = settings.thresholds || { warn: 75, crit: 90 };
-  refs.warn = numberInput(th.warn, 1, 100);
-  refs.crit = numberInput(th.crit, 1, 100);
-  track(refs.warn, "thresholds");
-  track(refs.crit, "thresholds");
-  const thWrap = document.createElement("span");
-  thWrap.append(refs.warn, refs.crit);
-  thWrap.style.display = "flex";
-  thWrap.style.gap = "4px";
-  card.appendChild(fieldRow("Warn / crit %", thWrap));
-
-  lastAccounts.forEach((a, i) => {
-    if (!a || typeof a.id !== "string") return;
-    const c = document.createElement("input");
-    c.type = "color";
-    c.value = colorFor(a.id, i);
-    track(c, "colors");
-    refs.colorInputs.set(a.id, c);
-    card.appendChild(fieldRow(typeof a.label === "string" ? a.label : a.id, c));
-  });
-
-  // -- Session switching --
-  section("Session switching");
-  const sess = settings.session || {};
-  refs.sessionCwd = document.createElement("input");
-  refs.sessionCwd.type = "text";
-  refs.sessionCwd.spellcheck = false;
-  refs.sessionCwd.placeholder = "(your home directory)";
-  refs.sessionCwd.value = typeof sess.cwd === "string" ? sess.cwd : "";
-  track(refs.sessionCwd, "session.cwd");
-  card.appendChild(fieldRow("Start directory", refs.sessionCwd));
-
-  refs.sessionTerminal = document.createElement("textarea");
-  refs.sessionTerminal.value = argvText(sess.terminal);
-  refs.sessionTerminal.spellcheck = false;
-  track(refs.sessionTerminal, "session.terminal");
-  const termField = document.createElement("div");
-  termField.className = "field";
-  const termLabel = document.createElement("span");
-  termLabel.className = "flabel";
-  termLabel.textContent = "Terminal command (one argument per line)";
-  termField.append(termLabel);
-  const termNote = document.createElement("div");
-  termNote.className = "note block";
-  // The fold rule diverges by platform on purpose (cuw-launch plan.rs): on
-  // Windows an override is a prefix unless it names {shim}; on macOS the
-  // default is `open -a Terminal <wrapper>`, so prefixing it is nonsense and a
-  // plain override is a launcher the wrapper path is appended to instead.
-  termNote.textContent = isMac()
-    ? "Blank uses Terminal.app. {wrapper} {shim} {nonce} {port} {cwd} substitute; a command naming any of them is used as written, anything else is a launcher the wrapper is appended to (open -a iTerm)."
-    : "Blank uses the default terminal. {shim} {nonce} {port} {cwd} substitute; a command containing {shim} replaces the default, anything else prefixes it.";
-  card.append(termField, refs.sessionTerminal, termNote);
-
-  // -- System --
-  section("System");
-  refs.autostart = checkboxInput(settings.autostart);
-  track(refs.autostart, "autostart");
-  card.appendChild(
-    fieldRow("Start at login", refs.autostart, "A dev build stores the flag without registering."),
-  );
-
-  refs.clickThrough = checkboxInput(settings.click_through);
-  track(refs.clickThrough, "click_through");
-  card.appendChild(
-    fieldRow("Click-through", refs.clickThrough, "Turn it off again from the tray icon."),
-  );
-
-  refs.alwaysOnTop = checkboxInput(settings.always_on_top);
-  track(refs.alwaysOnTop, "always_on_top");
-  card.appendChild(
-    fieldRow(
-      "Always on top",
-      refs.alwaysOnTop,
-      "A docked widget floats over its target anyway; enabling docking turns this off.",
-    ),
-  );
-
-  const err = document.createElement("div");
-  err.className = "error";
-  err.hidden = true;
-  const actions = document.createElement("div");
-  actions.className = "actions";
-  const done = makeButton("Done", "primary");
-  actions.append(done);
-  card.append(err, actions);
-
-  // Settings save automatically: Done, Escape and a click outside the panel
-  // all run the same save; an invalid field keeps the panel open instead.
-  let saving = false;
-  const saveAndClose = async () => {
-    err.hidden = true;
-    const patch = {};
-    if (touched.has("opacity")) patch.opacity = Number(refs.opacity.value);
-    if (touched.has("compact")) patch.compact = refs.compact.checked;
-    if (touched.has("show_scoped")) patch.show_scoped = refs.showScoped.checked;
-    if (touched.has("thresholds")) {
-      const w = Number(refs.warn.value);
-      const c = Number(refs.crit.value);
-      if (!Number.isFinite(w) || !Number.isFinite(c) || w < 1 || c > 100 || w >= c) {
-        err.textContent = "Thresholds: warn must be below crit (1–100).";
-        err.hidden = false;
-        return;
-      }
-      patch.thresholds = { warn: w, crit: c };
-    }
-    if (touched.has("autostart")) patch.autostart = refs.autostart.checked;
-    if (touched.has("click_through")) patch.click_through = refs.clickThrough.checked;
-    if (touched.has("always_on_top")) patch.always_on_top = refs.alwaysOnTop.checked;
-    if (touched.has("colors")) {
-      const map = { ...(settings.colors || {}) };
-      for (const [id, inp] of refs.colorInputs) map[id] = inp.value;
-      patch.colors = map;
-    }
-    const dockPatch = {};
-    if (touched.has("dock.enabled")) dockPatch.enabled = refs.dockEnabled.checked;
-    if (touched.has("dock.corner")) dockPatch.corner = refs.corner.value;
-    if (touched.has("dock.offset")) {
-      dockPatch.offset = {
-        x: Math.trunc(Number(refs.offx.value)) || 0,
-        y: Math.trunc(Number(refs.offy.value)) || 0,
-      };
-    }
-    if (touched.has("dock.inside")) dockPatch.inside = refs.inside.checked;
-    if (touched.has("dock.follow_focus")) dockPatch.follow_focus = refs.follow.checked;
-    if (touched.has("dock.allow")) dockPatch.allow = parseAllow(refs.allow.value);
-    if (Object.keys(dockPatch).length) patch.dock = dockPatch;
-
-    const sessionPatch = {};
-    if (touched.has("session.cwd")) sessionPatch.cwd = refs.sessionCwd.value.trim();
-    if (touched.has("session.terminal")) {
-      sessionPatch.terminal = parseArgv(refs.sessionTerminal.value);
-    }
-    if (Object.keys(sessionPatch).length) patch.session = sessionPatch;
-
-    if (!Object.keys(patch).length) {
-      closeModal();
-      return;
-    }
-    if (saving) return;
-    saving = true;
-    try {
-      await invoke("set_settings", { patch });
-      closeModal(); // settings-changed re-renders everything
-    } catch (e) {
-      err.textContent = String(e);
-      err.hidden = false;
-    } finally {
-      saving = false;
-    }
-  };
-
-  done.onclick = saveAndClose;
-  modalCancel = saveAndClose;
-  card.parentElement.addEventListener("mousedown", (e) => {
-    if (e.target === card.parentElement) saveAndClose();
-  });
-
-  panelRefs = refs;
-}
-
-// A Rust-side settings change while the panel is open (Attached rewriting
-// dock.enabled/remembered, a tray click-through toggle) updates the panel's
-// untouched fields in place; touched fields keep the user's edits.
-function refreshPanelFromSettings() {
-  if (!panelOpen || !panelRefs) return;
-  const r = panelRefs;
-  const untouched = (path) => !r.touched.has(path);
-  if (untouched("opacity") && r.opacity) {
-    r.opacity.value = String(Number.isFinite(settings.opacity) ? settings.opacity : 0.85);
-  }
-  if (untouched("compact") && r.compact) r.compact.checked = settings.compact === true;
-  if (untouched("show_scoped") && r.showScoped) {
-    r.showScoped.checked = settings.show_scoped === true;
-  }
-  if (untouched("thresholds") && r.warn && r.crit) {
-    const th = settings.thresholds || {};
-    if (Number.isFinite(th.warn)) r.warn.value = String(th.warn);
-    if (Number.isFinite(th.crit)) r.crit.value = String(th.crit);
-  }
-  if (untouched("autostart") && r.autostart) r.autostart.checked = settings.autostart === true;
-  if (untouched("click_through") && r.clickThrough) {
-    r.clickThrough.checked = settings.click_through === true;
-  }
-  if (untouched("always_on_top") && r.alwaysOnTop) {
-    r.alwaysOnTop.checked = settings.always_on_top === true;
-  }
-  const d = settings.dock || {};
-  if (untouched("dock.enabled") && r.dockEnabled) r.dockEnabled.checked = d.enabled === true;
-  if (untouched("dock.corner") && r.corner && typeof d.corner === "string") {
-    r.corner.value = d.corner;
-  }
-  if (untouched("dock.offset") && r.offx && r.offy && d.offset) {
-    if (Number.isFinite(d.offset.x)) r.offx.value = String(d.offset.x);
-    if (Number.isFinite(d.offset.y)) r.offy.value = String(d.offset.y);
-  }
-  if (untouched("dock.inside") && r.inside) r.inside.checked = d.inside === true;
-  if (untouched("dock.follow_focus") && r.follow) r.follow.checked = d.follow_focus === true;
-  if (untouched("dock.allow") && r.allow) r.allow.value = allowText(d.allow);
-  const se = settings.session || {};
-  if (untouched("session.cwd") && r.sessionCwd) {
-    r.sessionCwd.value = typeof se.cwd === "string" ? se.cwd : "";
-  }
-  if (untouched("session.terminal") && r.sessionTerminal) {
-    r.sessionTerminal.value = argvText(se.terminal);
-  }
-  // Read-only and never sent, so always current.
-  if (r.remembered) r.remembered.textContent = d.remembered || "(none)";
-}
-
 // --- Wiring -----------------------------------------------------------------
 
 // Drag the window by the widget body. WebView2 ignores -webkit-app-region, so
@@ -1433,7 +917,7 @@ function refreshPanelFromSettings() {
 document.getElementById("widget").addEventListener("mousedown", (e) => {
   if (e.button !== 0) return;
   if (e.target.closest("button, input, a, .modal, textarea, select")) return;
-  if (dockState === "docked" || clickThrough) return;
+  if (dockState === "docked" || clickThrough || menuBarMode()) return;
   const w = window.__TAURI__ && window.__TAURI__.window;
   if (w && w.getCurrentWindow) {
     w.getCurrentWindow()
@@ -1443,10 +927,14 @@ document.getElementById("widget").addEventListener("mousedown", (e) => {
 });
 
 // One Escape handler for every modal: each sets its own cancel path, and a
-// modal that must not be dismissed leaves it null.
+// modal that must not be dismissed leaves it null. With no modal up, Escape
+// closes the popover (a no-op in widget mode).
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && modalRoot.classList.contains("open") && modalCancel) {
-    modalCancel();
+  if (e.key !== "Escape") return;
+  if (modalRoot.classList.contains("open")) {
+    if (modalCancel) modalCancel();
+  } else {
+    invoke("hide_popover").catch(() => {});
   }
 });
 
@@ -1455,7 +943,10 @@ document.getElementById("connect").addEventListener("click", async () => {
   if (label) await runConnect(label);
 });
 
-document.getElementById("gear").addEventListener("click", openSettings);
+// Settings live in a window of their own (settings.js); Rust opens it.
+document.getElementById("gear").addEventListener("click", () => {
+  invoke("open_settings").catch(() => {});
+});
 
 document.getElementById("update").addEventListener("click", () => {
   if (updateUrl) invoke("open_release", { url: updateUrl }).catch(() => {});
@@ -1523,10 +1014,14 @@ function clearStatus() {
     settings = e.payload;
     applySettings();
     render(lastAccounts);
-    refreshPanelFromSettings();
+  });
+  // The settings window previews the opacity slider here while it is dragged;
+  // the saved value arrives as settings-changed and wins.
+  listen("preview-opacity", (e) => {
+    const o = e && e.payload;
+    if (Number.isFinite(o)) document.documentElement.style.setProperty("--bg-alpha", String(o));
   });
   listen("dock-state", (e) => setDock(e && e.payload));
-  listen("open-settings", () => openSettings());
   invoke("dock_state")
     .then(setDock)
     .catch(() => {});

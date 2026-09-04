@@ -6,7 +6,9 @@
 mod dock;
 #[cfg(any(windows, target_os = "macos"))]
 mod platform;
+mod popover;
 mod settings;
+mod settings_window;
 mod tray;
 mod update;
 
@@ -368,7 +370,9 @@ pub fn restyle(app: &AppHandle) {
     // background thread cannot lift a non-topmost window above the foreground
     // window), and drops back to normal otherwise so other applications cover
     // it. The always-on-top setting keeps it topmost unconditionally.
-    let topmost = always_on_top_setting(app) || dock::docked_and_focused(app);
+    // A popover floats for the moment it is open, whatever the setting says.
+    let topmost =
+        always_on_top_setting(app) || dock::docked_and_focused(app) || popover::active(app);
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(h) = overlay_hwnd(&app2) {
@@ -395,9 +399,12 @@ fn always_on_top_setting(app: &AppHandle) -> bool {
 /// Derive the window style from settings and dock state. Any thread: the
 /// window work is handed to the main thread (M6.3).
 pub fn apply_style_from_settings(app: &AppHandle) {
-    let click_through = click_through_setting(app);
-    let always_on_top = always_on_top_setting(app);
-    let docked = dock::is_docked(app);
+    let menu_bar = popover::active(app);
+    // A popover is focusable and solid by definition: it takes clicks, and it
+    // closes when the focus leaves it.
+    let click_through = click_through_setting(app) && !menu_bar;
+    let always_on_top = always_on_top_setting(app) || menu_bar;
+    let docked = dock::is_docked(app) && !menu_bar;
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(w) = app2.get_webview_window("main") {
@@ -434,8 +441,43 @@ pub fn set_interactive(app: &AppHandle, on: bool) {
 
 #[tauri::command]
 async fn modal_interactive(app: AppHandle, on: bool) -> Result<(), String> {
+    popover::set_modal_open(&app, on);
     set_interactive(&app, on);
     Ok(())
+}
+
+/// Escape in the popover. Widget mode ignores it: the tray is the way to hide.
+#[tauri::command]
+async fn hide_popover(app: AppHandle) -> Result<(), String> {
+    if !popover::active(&app) {
+        return Ok(());
+    }
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || tray::hide(&app2));
+    Ok(())
+}
+
+/// Switch between the floating widget and the menu bar popover (M7). Any
+/// thread: the window work is queued on the main thread. Settings are already
+/// validated for the new mode (no docking, no click-through in menu bar mode);
+/// a live dock still has to be torn down.
+pub fn apply_mode(app: &AppHandle, mode: settings::Mode) {
+    apply_style_from_settings(app);
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || match mode {
+        settings::Mode::MenuBar => {
+            tray::hide(&app2);
+            if dock::is_docked(&app2) {
+                let app3 = app2.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = dock::dock_stop(app3).await {
+                        eprintln!("undock for menu bar mode: {e}");
+                    }
+                });
+            }
+        }
+        settings::Mode::Widget => tray::show(&app2),
+    });
 }
 
 /// Register/unregister the overlay at login. A debug build only stores the
@@ -524,8 +566,10 @@ pub fn run() {
             let autostart = s.autostart;
             #[cfg(any(windows, target_os = "macos"))]
             let dock_boot = s.dock.enabled && s.dock.remembered.is_some();
+            let widget = s.mode == settings::Mode::Widget;
             app.manage(Mutex::new(s));
             app.manage(DaemonChild(Mutex::new(None)));
+            app.manage(popover::Popover::default());
             // Out of the Dock and out of Cmd-Tab is an *application* property on
             // macOS, not a per-window flag the way `WS_EX_TOOLWINDOW` is — so it
             // is set once here and never per window (plan §6). The bundle's
@@ -535,12 +579,26 @@ pub fn run() {
             if let Err(e) = handle.set_activation_policy(tauri::ActivationPolicy::Accessory) {
                 eprintln!("activation policy: {e}");
             }
+            // The window is configured hidden: a popover waits for its tray
+            // click, only the widget comes up on its own.
+            if widget {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                }
+            }
             restyle(&handle);
             if let Err(e) = tray::build(&handle) {
-                // Without the tray there is no way back from click-through.
-                eprintln!("tray unavailable, click-through forced off: {e}");
-                if let Err(e) = settings::update(&handle, |s| s.click_through = false) {
+                // Without the tray there is no way back from click-through,
+                // and no way to open a popover at all.
+                eprintln!("tray unavailable, widget mode without click-through forced: {e}");
+                if let Err(e) = settings::update(&handle, |s| {
+                    s.click_through = false;
+                    s.mode = settings::Mode::Widget;
+                }) {
                     eprintln!("could not clear click-through: {e}");
+                }
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
                 }
             }
             apply_style_from_settings(&handle);
@@ -562,7 +620,9 @@ pub fn run() {
         // Alt+F4 / close hides *while the tray exists* — it is the only way back
         // from a hidden window. With no tray the close proceeds and takes the
         // daemon with it, rather than stranding an invisible overlay (M6.2).
+        // Only the main window: the settings window closes for real.
         .on_window_event(|w, e| match e {
+            _ if w.label() != "main" => {}
             WindowEvent::CloseRequested { api, .. } => {
                 let app = w.app_handle();
                 if !tray::exists(app) {
@@ -579,6 +639,7 @@ pub fn run() {
             WindowEvent::Resized(s) if s.width > 0 && s.height > 0 => {
                 dock::replace_last(w.app_handle());
             }
+            WindowEvent::Focused(false) => popover::on_focus_lost(w.app_handle()),
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
@@ -587,6 +648,9 @@ pub fn run() {
             stop_daemon,
             daemon_port,
             modal_interactive,
+            hide_popover,
+            settings_window::open_settings,
+            settings_window::close_settings,
             open_url,
             update::check_update,
             update::open_release,

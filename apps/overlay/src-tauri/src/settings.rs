@@ -15,12 +15,15 @@ const FILE_NAME: &str = "settings.json";
 /// an older file once. v2: `dock.follow_focus` no longer hides the widget (that
 /// is automatic while docked now) — it only re-docks to another allowed window
 /// on focus, so a v1 `true` (which meant "hide") must not carry over as that.
-const SCHEMA_VERSION: u32 = 2;
+/// v3 adds `mode`; a v2 file has no widget-or-menu-bar choice yet and takes the
+/// menu bar default like a fresh install.
+const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Settings {
     pub version: u32,
+    pub mode: Mode,
     pub opacity: f32,
     pub compact: bool,
     pub thresholds: Thresholds,
@@ -31,6 +34,17 @@ pub struct Settings {
     pub colors: BTreeMap<String, String>,
     pub dock: Dock,
     pub session: Session,
+}
+
+/// Where the usage lives. `MenuBar`: no floating widget; the tray (menu bar)
+/// icon opens the same view as a popover that closes when it loses focus.
+/// `Widget`: the floating always-there overlay, which can dock.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    #[default]
+    MenuBar,
+    Widget,
 }
 
 /// How a switched session is started (SWITCHER §5). `terminal` is argv, never a
@@ -96,6 +110,7 @@ pub struct AllowSpec {
 #[derive(Deserialize, Default, Debug)]
 #[serde(default)]
 pub struct SettingsPatch {
+    pub mode: Option<Mode>,
     pub opacity: Option<f32>,
     pub compact: Option<bool>,
     pub thresholds: Option<Thresholds>,
@@ -131,6 +146,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             version: SCHEMA_VERSION,
+            mode: Mode::MenuBar,
             opacity: 0.85,
             compact: false,
             thresholds: Thresholds::default(),
@@ -253,6 +269,12 @@ pub fn validate(mut s: Settings) -> Settings {
         }
         s.version = SCHEMA_VERSION;
     }
+    // A popover has nothing to dock to and nothing to click through: the
+    // window only exists while it holds focus.
+    if s.mode == Mode::MenuBar {
+        s.dock.enabled = false;
+        s.click_through = false;
+    }
     // A docked widget is placed over its target and floats above it anyway,
     // so docking turns the global always-on-top off rather than fighting it.
     if s.dock.enabled {
@@ -287,6 +309,7 @@ fn is_hex_color(v: &str) -> bool {
 /// Apply every `Some` in the patch. `dock.remembered` is never touched.
 pub fn merge(base: &mut Settings, patch: SettingsPatch) {
     let SettingsPatch {
+        mode,
         opacity,
         compact,
         thresholds,
@@ -298,6 +321,9 @@ pub fn merge(base: &mut Settings, patch: SettingsPatch) {
         dock,
         session,
     } = patch;
+    if let Some(v) = mode {
+        base.mode = v;
+    }
     if let Some(v) = opacity {
         base.opacity = v;
     }
@@ -379,6 +405,7 @@ pub fn update(app: &AppHandle, f: impl FnOnce(&mut Settings)) -> Result<Settings
 /// Which side effects a settings change needs (M6.3).
 #[derive(Debug, PartialEq, Eq, Default)]
 struct Effects {
+    mode: bool,
     style: bool,
     autostart: bool,
     placement: bool,
@@ -386,6 +413,7 @@ struct Effects {
 
 fn diff(old: &Settings, new: &Settings) -> Effects {
     Effects {
+        mode: old.mode != new.mode,
         style: old.click_through != new.click_through || old.always_on_top != new.always_on_top,
         autostart: old.autostart != new.autostart,
         placement: old.dock.corner != new.dock.corner
@@ -399,9 +427,14 @@ fn diff(old: &Settings, new: &Settings) -> Effects {
 /// window work happens inline: the callees hop to the main thread themselves.
 pub fn on_changed(app: &AppHandle, old: &Settings, new: &Settings) {
     let e = diff(old, new);
-    if e.style {
+    if e.mode {
+        // Undocks, re-styles and shows or hides the window itself.
+        crate::apply_mode(app, new.mode);
+    } else if e.style {
         crate::apply_style_from_settings(app);
-        crate::tray::sync_click_through(app, new.click_through);
+    }
+    if e.mode || e.style {
+        crate::tray::sync_settings(app, new);
     }
     if e.autostart {
         crate::apply_autostart(app, new.autostart);
@@ -544,13 +577,21 @@ mod tests {
 
     #[test]
     fn enabling_docking_turns_always_on_top_off() {
-        let mut s = Settings::default();
-        s.always_on_top = true;
-        s.dock.enabled = true;
+        let s = Settings {
+            mode: Mode::Widget,
+            always_on_top: true,
+            dock: Dock {
+                enabled: true,
+                ..Dock::default()
+            },
+            ..Settings::default()
+        };
         assert!(!validate(s).always_on_top);
 
-        let mut undocked = Settings::default();
-        undocked.always_on_top = true;
+        let undocked = Settings {
+            always_on_top: true,
+            ..Settings::default()
+        };
         assert!(validate(undocked).always_on_top);
     }
 
@@ -566,6 +607,28 @@ mod tests {
         let raw2 = r#"{"version":2,"dock":{"enabled":true,"follow_focus":true}}"#;
         let s2 = validate(serde_json::from_str::<Settings>(raw2).unwrap());
         assert!(s2.dock.follow_focus);
+    }
+
+    #[test]
+    fn menu_bar_mode_is_the_default_and_clears_widget_only_flags() {
+        assert_eq!(Settings::default().mode, Mode::MenuBar);
+        // A pre-v3 file has no mode and lands on the menu bar like a new install.
+        let raw = r#"{"version":2,"dock":{"enabled":true},"click_through":true}"#;
+        let s = validate(serde_json::from_str::<Settings>(raw).unwrap());
+        assert_eq!(s.mode, Mode::MenuBar);
+        assert!(!s.dock.enabled);
+        assert!(!s.click_through);
+        assert_eq!(s.version, SCHEMA_VERSION);
+
+        let raw2 = r#"{"version":3,"mode":"widget","dock":{"enabled":true},"click_through":true}"#;
+        let s2 = validate(serde_json::from_str::<Settings>(raw2).unwrap());
+        assert_eq!(s2.mode, Mode::Widget);
+        assert!(s2.dock.enabled);
+        assert!(s2.click_through);
+        assert_eq!(
+            serde_json::to_string(&Mode::MenuBar).unwrap(),
+            "\"menu_bar\""
+        );
     }
 
     #[test]
@@ -633,6 +696,16 @@ mod tests {
     fn diff_flags_only_changed_fields() {
         let base = Settings::default();
         assert_eq!(diff(&base, &base), Effects::default());
+
+        let mut menu = base.clone();
+        menu.mode = Mode::Widget;
+        assert_eq!(
+            diff(&base, &menu),
+            Effects {
+                mode: true,
+                ..Effects::default()
+            }
+        );
 
         let mut ct = base.clone();
         ct.click_through = true;

@@ -75,11 +75,15 @@ pub async fn dock_state(app: AppHandle) -> DockState {
 /// What the UI may honestly say about the Accessibility grant (plan §6).
 /// macOS docking works without it and only gets smoother with it, so this is a
 /// hint and never a gate. `applicable` is false where there is no such
-/// permission to ask for, which is every platform but macOS.
+/// permission to ask for, which is every platform but macOS. `dev`: an
+/// ad-hoc-signed debug binary gets a new code hash on every rebuild, and TCC
+/// keys the grant on that hash, so the toggle in System Settings stays on
+/// while the process is no longer trusted — the panel says so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Accessibility {
     pub applicable: bool,
     pub trusted: bool,
+    pub dev: bool,
 }
 
 #[tauri::command]
@@ -88,11 +92,13 @@ pub async fn dock_accessibility() -> Accessibility {
     return Accessibility {
         applicable: true,
         trusted: cuw_tracker::macos::accessibility_trusted(),
+        dev: cfg!(debug_assertions),
     };
     #[cfg(not(target_os = "macos"))]
     Accessibility {
         applicable: false,
         trusted: false,
+        dev: cfg!(debug_assertions),
     }
 }
 
@@ -634,13 +640,14 @@ mod tests {
     use super::{Accessibility, DockState};
 
     #[test]
-    fn accessibility_serializes_the_two_flags_the_panel_reads() {
+    fn accessibility_serializes_the_flags_the_panel_reads() {
         let json = serde_json::to_string(&Accessibility {
             applicable: true,
             trusted: false,
+            dev: false,
         })
         .unwrap();
-        assert_eq!(json, r#"{"applicable":true,"trusted":false}"#);
+        assert_eq!(json, r#"{"applicable":true,"trusted":false,"dev":false}"#);
     }
 
     #[test]
