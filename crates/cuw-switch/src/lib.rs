@@ -229,19 +229,25 @@ fn replace_file(path: &Path, text: &str, private: bool) -> Result<(), String> {
         path.file_name().and_then(OsStr::to_str).unwrap_or("store"),
         std::process::id()
     ));
-    let written = write_private(&tmp, text, private).and_then(|()| {
-        #[cfg(unix)]
-        if !private {
-            if let Ok(meta) = std::fs::metadata(path) {
-                std::fs::set_permissions(&tmp, meta.permissions())?;
-            }
-        }
-        Ok(())
-    });
+    let written = write_private(&tmp, text, private).and_then(|()| keep_mode(path, &tmp, private));
     if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("{display}: {e}"));
     }
+    Ok(())
+}
+
+/// Carry an existing target's mode over to its replacement. A private file
+/// already has the mode it needs; elsewhere there is no mode to keep.
+fn keep_mode(target: &Path, tmp: &Path, private: bool) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if !private {
+        if let Ok(meta) = std::fs::metadata(target) {
+            std::fs::set_permissions(tmp, meta.permissions())?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (target, tmp, private);
     Ok(())
 }
 

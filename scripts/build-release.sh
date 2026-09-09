@@ -111,6 +111,10 @@ done
 if [ -z "$found_dmg" ]; then
     echo "  installer   : (no .dmg; the bundler needs hdiutil)"
 fi
+# `if`, not `&&`: under `set -e` a false test as the script's last command
+# would make a build without the signing key exit 1 after succeeding.
 for sig in "$release"/bundle/macos/*.app.tar.gz.sig; do
-    [ -f "$sig" ] && echo "  updater sig : $sig"
+    if [ -f "$sig" ]; then
+        echo "  updater sig : $sig"
+    fi
 done
