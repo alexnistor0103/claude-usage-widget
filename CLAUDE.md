@@ -20,9 +20,11 @@ localhost) and the Tauri `overlay` (renders percentages, never sees a token).
 - `crates/cuw-daemon` — poll loop + localhost HTTP/SSE. The only token holder.
 - `crates/cuw-tracker` — `WindowTracker` trait, per-platform docking impls;
   runs on a thread inside the overlay.
-- `crates/cuw-launch` — `SessionLauncher` trait, the launch shims, per-platform
-  spawn. Starts a terminal on a shim that redeems a nonce for a CLI token; the
-  crate itself never holds one.
+- `crates/cuw-switch` — `CliStore` trait over Claude Code's *own* credential
+  store (Keychain on macOS, `.credentials.json` elsewhere) and the
+  `oauthAccount` block in `.claude.json`. A switch writes an account's
+  credential there, exactly as `/login` does, so every running `claude`
+  follows.
 - `apps/overlay` — Tauri v2 shell. Detached from the workspace (own build).
 
 ## Commands
@@ -32,7 +34,7 @@ cargo check                       # the five backend crates
 cargo test                        # unit + golden tests
 cargo test -p cuw-tracker -- --ignored --test-threads=1   # live hook tests; spawn console
                                   # windows and fight over foreground focus — never in parallel
-cargo test -p cuw-launch -- --ignored   # opens one real console; it must stay at a prompt
+cargo test -p cuw-switch -- --ignored   # macOS: round-trips a throwaway login Keychain item
 cargo clippy --all-targets
 cargo fmt
 cargo run -p cuw-daemon           # stop a running daemon first (it locks the exe)
@@ -76,7 +78,14 @@ Stop a running daemon before building it:
   failure → `unavailable`, never a wrong number; numbers held without a fresh
   200 carry `stale: true`.
 - **Tokens never leave the daemon** — not to the overlay, not to logs. Redact
-  on every path, including errors.
+  on every path, including errors. The one deliberate handoff is a switch:
+  `cuw-switch` writes the account's credential into Claude Code's own store,
+  and only there.
+- **The CLI's store is shared state.** After a switch the poll loop reconciles
+  every cycle: a token the CLI refreshed is adopted (its refresh token may be
+  the only live one), a token the daemon refreshed is written back, and an
+  account the CLI no longer holds stops being `active`. Identity is the
+  `accountUuid` captured at connect; never adopt on a bare token mismatch.
 - **Do not poll faster than one request per account per minute.** Jitter, and
   back off hard on 429/5xx.
 - Parse the usage response defensively — never `serde` into required fields.

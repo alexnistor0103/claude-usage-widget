@@ -332,19 +332,30 @@ function rowNode(a, index) {
   const name = document.createElement("span");
   name.className = "name";
   name.textContent = label;
+  const hints = [];
+  if (a && typeof a.email === "string" && a.email) hints.push(a.email);
   if (a && typeof a.access_expires_at === "string") {
     const t = Date.parse(a.access_expires_at);
-    if (!Number.isNaN(t)) name.title = `access token until ${new Date(t).toLocaleString()}`;
+    if (!Number.isNaN(t)) hints.push(`access token until ${new Date(t).toLocaleString()}`);
   }
+  if (hints.length) name.title = hints.join(" · ");
   const right = document.createElement("span");
   right.className = "right";
   const disc = actionButton("×", "disconnect", id, label, "icon");
   disc.title = "Disconnect";
   head.append(name, right);
-  // Only an account holding a `<id>#cli` grant can be switched to (SWITCHER §6).
-  if (a && a.can_switch === true) {
+  // The account the CLI is signed in as gets a marker; every other one gets
+  // the button that makes it so — except a row whose token is dead, which
+  // the daemon would refuse anyway.
+  if (a && a.active === true) {
+    const on = document.createElement("span");
+    on.className = "active-mark";
+    on.textContent = "●";
+    on.title = "claude is signed in as this account";
+    head.appendChild(on);
+  } else if (state !== "reconnect needed") {
     const sw = actionButton("▸", "switch", id, label, "icon switch");
-    sw.title = `Start a new session as ${label}`;
+    sw.title = `Sign claude in as ${label}`;
     head.appendChild(sw);
   }
   head.appendChild(disc);
@@ -378,13 +389,6 @@ function rowNode(a, index) {
   }
   if (a && a.persist_pending === true) {
     row.appendChild(secondaryLine("warn", "not saved — reconnect after restart"));
-  }
-  // No CLI grant is a display state, not an error (SWITCHER §6). A row already
-  // asking for a reconnect says it once; this line would only repeat it.
-  if (a && a.can_switch !== true && state !== "reconnect needed") {
-    const note = secondaryLine("switch-note", "switch unavailable · ");
-    note.appendChild(actionButton("Enable", "reconnect", id, label, "btn small"));
-    row.appendChild(note);
   }
   if (settings.show_scoped === true) appendScoped(row, a && a.scoped);
   return row;
@@ -770,12 +774,6 @@ function handleConnectPhase(obj) {
       appendLog("Credential captured.");
       hideCodeBox(); // no code needed once we have the credential
       break;
-    case "setup_token":
-      appendLog("Step 2 of 2: authorizing a session token. Approve the new browser page too.");
-      break;
-    case "cli_token_captured":
-      appendLog("Session token captured — switching is enabled for this account.");
-      break;
     case "validated":
       appendLog(`Validated${obj.label ? ` ${obj.label}` : ""}.`);
       hideCodeBox();
@@ -835,10 +833,6 @@ function openConnectModal(title) {
   modalCancel = () => {
     if (!connectActive) close.click();
   };
-
-  // Two consent screens, not one (SWITCHER §3): the second authorizes the
-  // token session switching uses, and reads as a bug unless it is announced.
-  appendLog("This signs in twice: once for usage, once for session switching. Approve both.");
   return { close };
 }
 
@@ -893,68 +887,47 @@ async function runReconnect(label, id) {
   }
 }
 
-// --- Session switching ------------------------------------------------------
+// --- Account switching ------------------------------------------------------
 
-// One launch in flight per account. The row is rebuilt on every accounts frame,
-// so a disabled button would not survive; the guard lives here instead.
+// One switch in flight per account. The row is rebuilt on every accounts
+// frame, so a disabled button would not survive; the guard lives here instead.
 const switching = new Set();
 
-function sessionCwd() {
-  const c = settings.session && settings.session.cwd;
-  return typeof c === "string" && c.trim() ? c.trim() : "";
-}
-
-// The daemon defaults to the user's home when the overlay names no directory.
-function sessionWhere() {
-  const c = sessionCwd();
-  return c ? `It starts in ${c}.` : "It starts in your home directory.";
-}
-
-// POST /accounts/:id/session. The answer is `ok` and never a token: the shim the
-// daemon spawns fetches its own, so the overlay still sees none (SWITCHER §4).
-async function startSession(id, label) {
+// POST /accounts/:id/switch. The daemon writes the account's credential into
+// claude's own store — what /login does — so every claude, including the ones
+// already running, is signed in as it. The answer is `ok`, never a token.
+async function switchAccount(id, label) {
   if (switching.has(id)) return;
   const ok = await confirmModal(
-    "Start a session",
-    `Open a terminal running claude as "${label}"? ${sessionWhere()}` +
-      " Sessions already running keep the account they signed in with.",
-    "Start",
+    "Switch account",
+    `Sign claude in as "${label}"? This replaces the account claude is using now, ` +
+      "in every terminal, the same way /login does.",
+    "Switch",
     "primary",
   );
   if (!ok) return;
   switching.add(id);
-  showStatus(`starting a session as ${label}…`);
+  showStatus(`switching claude to ${label}…`);
   try {
-    const body = {};
-    const cwd = sessionCwd();
-    if (cwd) body.cwd = cwd;
-    const term = settings.session && settings.session.terminal;
-    if (Array.isArray(term) && term.length) body.terminal = term;
-    const res = await authFetch(`/accounts/${encodeURIComponent(id)}/session`, {
+    const res = await authFetch(`/accounts/${encodeURIComponent(id)}/switch`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
     });
     if (res.ok) {
-      showStatus(`session started as ${label}`);
+      showStatus(`claude is now signed in as ${label}`);
     } else if (res.status === 401) {
       bearer = null; // re-read on the next stream pass, as the poller does
-      await noticeModal("Could not start a session", "Not authenticated yet — try again.");
+      await noticeModal("Could not switch", "Not authenticated yet — try again.");
     } else if (res.status === 409) {
-      // The row already says `switch unavailable`; say why, and where the fix is.
       await noticeModal(
-        "Switch unavailable",
-        `"${label}" has no session token. Reconnect it to enable switching.`,
+        "Could not switch",
+        `"${label}" has no stored credential. Reconnect it first.`,
       );
     } else {
       const detail = await res.text().catch(() => "");
-      await noticeModal(
-        "Could not start a session",
-        detail || `The daemon answered ${res.status}.`,
-      );
+      await noticeModal("Could not switch", detail || `The daemon answered ${res.status}.`);
     }
   } catch {
-    await noticeModal("Could not start a session", "The daemon is unreachable.");
+    await noticeModal("Could not switch", "The daemon is unreachable.");
   } finally {
     switching.delete(id);
   }
@@ -1032,7 +1005,7 @@ rows.addEventListener("click", async (e) => {
     );
     if (ok) await runReconnect(label || "account", id);
   } else if (action === "switch") {
-    await startSession(id, label || "account");
+    await switchAccount(id, label || "account");
   }
 });
 

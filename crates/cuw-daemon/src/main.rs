@@ -2,18 +2,17 @@
 //! process that touches tokens (plan §5).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
 use cuw_core::model::AccountState;
 use cuw_core::refresh::OAuthTokenClient;
-use cuw_creds::{CredentialStore, KeyringStore};
+use cuw_creds::{CredError, CredentialStore, KeyringStore};
 use cuw_daemon::http::{self, AppState, SharedSource};
 use cuw_daemon::registry::Registry;
-use cuw_daemon::session::Nonces;
 use cuw_daemon::state::{self, Row};
 use cuw_daemon::{auth, config, startup};
+use cuw_switch::CliStore;
 use rand::Rng;
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, Mutex, Notify, RwLock};
@@ -52,6 +51,15 @@ async fn main() -> anyhow::Result<()> {
 
     let store: Arc<dyn CredentialStore> = Arc::new(KeyringStore);
     let (events, _) = broadcast::channel(256);
+    // No home dir is a display state: nothing is ever active and a switch is
+    // refused, but polling carries on.
+    let cli: Arc<dyn CliStore> = match cuw_switch::Installed::detect() {
+        Ok(installed) => Arc::new(installed),
+        Err(e) => {
+            tracing::warn!(error = %e, "cli store unavailable; switching disabled");
+            Arc::new(cuw_switch::NoStore)
+        }
+    };
 
     let app = AppState {
         rows: Arc::new(RwLock::new(HashMap::new())),
@@ -67,12 +75,9 @@ async fn main() -> anyhow::Result<()> {
         refresher: Arc::new(OAuthTokenClient::default()),
         shutdown: Arc::new(Notify::new()),
         connect_task: Arc::new(Mutex::new(None)),
-        sessions: Arc::new(Mutex::new(Nonces::default())),
-        launcher: Arc::from(cuw_launch::for_this_platform(&data_dir)),
-        // Filled in once the listener binds; a launch before then is refused
-        // rather than pointed at a port nothing is listening on.
-        port: Arc::new(AtomicU16::new(0)),
-        default_cwd: Arc::new(default_cwd()),
+        cli,
+        active: Arc::new(RwLock::new(None)),
+        cli_lock: Arc::new(Mutex::new(())),
     };
 
     // The overlay reads the pid as a last-resort kill if `POST /shutdown` fails.
@@ -88,9 +93,6 @@ async fn main() -> anyhow::Result<()> {
     // 8787 — the single source of truth for the localhost address (plan §5).
     let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(cfg.port);
     let _ = std::fs::write(data_dir.join("port"), bound_port.to_string());
-    // The shim is told this port on the command line, so it must be the bound
-    // one, not the configured one (SWITCHER §4).
-    app.port.store(bound_port, Ordering::Relaxed);
     tracing::info!(port = bound_port, "cuw-daemon serving");
 
     // The graceful path: ctrl-c or `POST /shutdown` → abort the connect task
@@ -144,15 +146,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Where a switched session starts when the overlay names no directory: the
-/// user's home, falling back to wherever the daemon itself was started.
-fn default_cwd() -> std::path::PathBuf {
-    directories::UserDirs::new()
-        .map(|d| d.home_dir().to_path_buf())
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-}
-
 /// Remove every leftover connect scratch dir: a crash mid-connect can leave a
 /// plaintext credential behind (plan §4). Only the count is logged.
 fn sweep_scratch(root: &std::path::Path) {
@@ -190,16 +183,21 @@ async fn seed_from_registry(app: &AppState, registry_path: &std::path::Path) {
     for (i, acc) in reg.accounts.into_iter().enumerate() {
         let connected_at =
             state::parse_rfc3339(&acc.connected_at).unwrap_or_else(OffsetDateTime::now_utc);
+        let account = acc.account();
 
-        // Absent is ordinary: the account predates M7.2, or its `setup-token`
-        // step did not complete. The row shows `switch unavailable` until a
-        // reconnect captures one (SWITCHER §3).
-        let can_switch = app.store.get_cli(&acc.id).is_ok();
+        // An earlier build stored a second, `setup-token` grant per account.
+        // Nothing reads it any more; leaving it would keep a live token in the
+        // store for nothing.
+        match app.store.delete_cli(&acc.id) {
+            Ok(()) => tracing::info!(id = %acc.id, "removed a leftover cli token"),
+            Err(CredError::NotFound(_) | CredError::Corrupt(_)) => {}
+            Err(e) => tracing::warn!(id = %acc.id, error = %e, "leftover cli token not removed"),
+        }
 
         match app.store.get(&acc.id) {
             Ok(cred) => {
                 let mut row = Row::new(acc.label, AccountState::Unavailable, connected_at);
-                row.can_switch = can_switch;
+                row.account = account;
                 app.rows.write().await.insert(acc.id.clone(), row);
                 // Stagger + jitter so a restart with several near-expiry
                 // credentials cannot burst the token endpoint (plan §4).
@@ -211,11 +209,8 @@ async fn seed_from_registry(app: &AppState, registry_path: &std::path::Path) {
             // `%e` only: a CredError must never be formatted with `?e` (plan §5).
             Err(e) => {
                 tracing::warn!(id = %acc.id, error = %e, "no usable credential; needs reconnect");
-                // Switching does not depend on the widget's own credential —
-                // the two grants are independent (SWITCHER §3) — so a row that
-                // cannot poll can still open a session.
                 let mut row = Row::new(acc.label, AccountState::ReconnectNeeded, connected_at);
-                row.can_switch = can_switch;
+                row.account = account;
                 app.rows.write().await.insert(acc.id.clone(), row);
             }
         }

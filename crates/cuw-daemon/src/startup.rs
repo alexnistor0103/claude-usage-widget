@@ -17,8 +17,8 @@ use anyhow::Context;
 const DATA_DIR_ENV: &str = "CUW_DATA_DIR";
 
 /// The daemon's data dir, created if missing. Everything the daemon owns hangs
-/// off this: `registry.toml`, `bearer.token`, `port`, `pid`, `scratch/`, the
-/// launch shims (plan §4, §5).
+/// off this: `registry.toml`, `bearer.token`, `port`, `pid`, `scratch/`
+/// (plan §4, §5).
 pub fn data_dir() -> anyhow::Result<PathBuf> {
     let dir = match data_dir_override(std::env::var(DATA_DIR_ENV).ok().as_deref()) {
         Some(dir) => dir,

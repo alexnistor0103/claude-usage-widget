@@ -79,7 +79,6 @@ function defaultSettings() {
           ],
       show_accessibility_hint: true,
     },
-    session: { terminal: [], cwd: "" },
   };
 }
 

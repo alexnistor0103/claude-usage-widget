@@ -227,9 +227,14 @@ body.compact .scoped {
   color: var(--bar);
 }
 
-/* An account with no CLI grant (SWITCHER §6): a state, with its own way out. */
-.secondary.switch-note .btn.small {
-  vertical-align: baseline;
+/* The account claude is signed in as. Same footprint as the switch button,
+   so the row does not shift when the marker moves. */
+.active-mark {
+  color: var(--bar);
+  font-size: 10px;
+  line-height: 1;
+  padding: 0 4px;
+  cursor: default;
 }
 
 .status {

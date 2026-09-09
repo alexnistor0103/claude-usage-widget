@@ -209,13 +209,13 @@ dependencies = [
 
 [[package]]
 name = "cuw-connect"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "cuw-core",
+ "cuw-switch",
  "portable-pty",
  "serde_json",
- "sha2",
  "thiserror 2.0.20",
  "time",
  "tokio",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "rand",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-creds"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cuw-core",
  "keyring",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-daemon"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -259,7 +259,7 @@ dependencies = [
  "cuw-connect",
  "cuw-core",
  "cuw-creds",
- "cuw-launch",
+ "cuw-switch",
  "directories",
  "rand",
  "serde",
@@ -276,18 +276,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "cuw-launch"
-version = "0.3.0"
+name = "cuw-switch"
+version = "0.4.0"
 dependencies = [
+ "cuw-core",
+ "directories",
  "libc",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.20",
  "tracing",
- "windows",
 ]
 
 [[package]]
 name = "cuw-tracker"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "objc2",

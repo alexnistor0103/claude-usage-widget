@@ -11,7 +11,7 @@ pub mod redact;
 pub mod refresh;
 
 pub use client::{OAuthUsageClient, UsageSource};
-pub use credential::{CliToken, Credential};
+pub use credential::Credential;
 pub use model::{AccountState, ScopedWindow, Usage, Window};
 pub use parse::parse_usage;
 pub use redact::redact;

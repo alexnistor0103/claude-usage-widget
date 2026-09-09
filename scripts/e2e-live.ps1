@@ -263,7 +263,7 @@ elseif ($withAuth.Body -match 'sk-ant') { $wireOk = $false; $why = 'response bod
 else {
     $accounts = $withAuth.Body | ConvertFrom-Json
     if ($null -eq $accounts) { $accounts = @() }
-    $need = @('stale', 'fetched_at', 'scoped', 'access_expires_at', 'refreshed_at', 'refresh', 'persist_pending', 'can_switch')
+    $need = @('stale', 'fetched_at', 'scoped', 'access_expires_at', 'refreshed_at', 'refresh', 'persist_pending', 'active')
     foreach ($a in @($accounts)) {
         $names = $a.PSObject.Properties.Name
         foreach ($k in $need) {
@@ -282,25 +282,24 @@ else {
 }
 if ($wireOk) { Report 'auth-wire' 'PASS' $why } else { Report 'auth-wire' 'FAIL' $why }
 
-# --- 3b. Session routes (M7.2) ----------------------------------------------
-# No live login needed: an unknown account, an unminted code and a missing
-# bearer are all answerable without one. The one thing never asserted here is a
-# real token - the script must not be able to print one.
+# --- 3b. Switch route ---------------------------------------------------------
+# No live login needed: an unknown account and a missing bearer are both
+# answerable without one, and neither may ever touch the CLI's own store. The
+# one thing never asserted here is a real token - the script must not be able
+# to print one.
 
-$sessNoAuth = Invoke-Cuw 'GET' '/session/0123456789abcdef0123456789abcdef' $null -NoAuth
-$sessUnknown = Invoke-Cuw 'GET' '/session/0123456789abcdef0123456789abcdef' $null
-$switchUnknown = Invoke-Cuw 'POST' '/accounts/no-such-account/session' '{}'
-$sessionOk = $true
+$switchNoAuth = Invoke-Cuw 'POST' '/accounts/no-such-account/switch' $null -NoAuth
+$switchUnknown = Invoke-Cuw 'POST' '/accounts/no-such-account/switch' $null
+$switchOk = $true
 $why = ''
-if ($sessNoAuth.Status -ne 401) { $sessionOk = $false; $why = "unauthenticated redeem gave $($sessNoAuth.Status), want 401" }
-elseif ($sessUnknown.Status -ne 404) { $sessionOk = $false; $why = "unknown code gave $($sessUnknown.Status), want 404" }
-elseif ($switchUnknown.Status -ne 404) { $sessionOk = $false; $why = "switch on an unknown account gave $($switchUnknown.Status), want 404" }
-elseif (($sessUnknown.Body -match 'sk-ant') -or ($switchUnknown.Body -match 'sk-ant')) {
-    $sessionOk = $false; $why = 'a refusal body contains a token prefix'
+if ($switchNoAuth.Status -ne 401) { $switchOk = $false; $why = "unauthenticated switch gave $($switchNoAuth.Status), want 401" }
+elseif ($switchUnknown.Status -ne 404) { $switchOk = $false; $why = "switch on an unknown account gave $($switchUnknown.Status), want 404" }
+elseif ($switchUnknown.Body -match 'sk-ant') {
+    $switchOk = $false; $why = 'a refusal body contains a token prefix'
 } else {
-    $why = 'redeem needs the bearer; unknown code and unknown account both 404'
+    $why = 'switch needs the bearer; an unknown account is 404'
 }
-if ($sessionOk) { Report 'session' 'PASS' $why } else { Report 'session' 'FAIL' $why }
+if ($switchOk) { Report 'switch' 'PASS' $why } else { Report 'switch' 'FAIL' $why }
 
 # --- 4. SSE first frame -----------------------------------------------------
 

@@ -20,6 +20,26 @@ pub struct RegAccount {
     /// RFC3339. Kept as a string so a hand-edit with an odd value degrades to a
     /// substituted timestamp rather than failing the whole load.
     pub connected_at: String,
+    /// The CLI's `oauthAccount` block for this login, as JSON text: uuid,
+    /// email, org. Text rather than a table so the CLI's nulls survive TOML.
+    /// Absent for an account connected before it was captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_account: Option<String>,
+}
+
+impl RegAccount {
+    /// The identity block, if stored and still well-formed.
+    pub fn account(&self) -> Option<serde_json::Value> {
+        let v: serde_json::Value = serde_json::from_str(self.oauth_account.as_deref()?).ok()?;
+        cuw_switch::account_uuid(&v).is_some().then_some(v)
+    }
+
+    /// Store an identity block as text; a block without a uuid is not kept.
+    pub fn set_account(&mut self, account: Option<&serde_json::Value>) {
+        self.oauth_account = account
+            .filter(|a| cuw_switch::account_uuid(a).is_some())
+            .map(serde_json::Value::to_string);
+    }
 }
 
 impl Registry {
@@ -57,6 +77,7 @@ mod tests {
             id: id.into(),
             label: id.into(),
             connected_at: "2026-08-31T09:56:14Z".into(),
+            oauth_account: None,
         }
     }
 
@@ -66,14 +87,22 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("registry.toml");
 
+        let mut work = account("work-f9ca7144");
+        work.set_account(Some(&serde_json::json!({
+            "accountUuid": "u-1", "emailAddress": "w@example.com", "seatTier": null
+        })));
         let reg = Registry {
-            accounts: vec![account("personal-5cb2ab9c"), account("work-f9ca7144")],
+            accounts: vec![account("personal-5cb2ab9c"), work],
         };
         reg.save(&path).expect("save");
 
         let back = Registry::load(&path);
         assert_eq!(back.accounts.len(), 2);
         assert_eq!(back.accounts[1].id, "work-f9ca7144");
+        assert!(back.accounts[0].account().is_none());
+        let acct = back.accounts[1].account().expect("identity kept");
+        assert_eq!(acct["emailAddress"], "w@example.com");
+        assert!(acct["seatTier"].is_null(), "the CLI's nulls survive");
         assert!(!path.with_extension("toml.new").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -90,5 +119,16 @@ mod tests {
         assert!(Registry::load(&path).accounts.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_block_without_a_uuid_or_with_bad_text_is_not_an_identity() {
+        let mut a = account("x-00000000");
+        a.set_account(Some(
+            &serde_json::json!({"emailAddress": "no-uuid@example.com"}),
+        ));
+        assert_eq!(a.oauth_account, None);
+        a.oauth_account = Some("{not json".into());
+        assert!(a.account().is_none());
     }
 }

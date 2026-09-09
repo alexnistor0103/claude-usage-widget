@@ -70,6 +70,9 @@ pub struct PollState {
     pub persist_logged: bool,
     /// One forced refresh per 429 outage (plan §8 Q12).
     pub forced_for_429: bool,
+    /// CLI-store read failure logged once per streak; also marks the last
+    /// read as unknown rather than empty.
+    pub cli_read_logged: bool,
 }
 
 /// What the loop should do after applying a result.
@@ -89,6 +92,47 @@ pub enum RefreshStep {
     Rotated(Credential),
     Reconnect,
     Backoff,
+}
+
+/// What one look at the CLI's own store (cuw-switch) means for an account.
+#[derive(Debug, PartialEq)]
+pub enum Reconcile {
+    /// The CLI holds this account's current token: nothing to do.
+    Active,
+    /// The CLI holds this account and has a token we do not: take its copy.
+    /// After a rotation the CLI's refresh token may be the only live one.
+    Adopt(Credential),
+    /// The CLI holds an older token of ours — a write-back that failed, or a
+    /// restart in between. Ours goes back in.
+    Behind,
+    /// The CLI holds nothing, or another account.
+    Foreign,
+}
+
+/// Compare the CLI's store against this account. The CLI's copy is ours when
+/// a token is still shared (one rotation apart at most), or when both sides
+/// name the same account uuid. Either way the later expiry wins: a fresh
+/// login of the same account is adopted, and a dead lineage the CLI still
+/// holds after a reconnect is replaced rather than taken back.
+pub fn reconcile(
+    cli: Option<&Credential>,
+    cli_uuid: Option<&str>,
+    mine: &Credential,
+    my_uuid: Option<&str>,
+) -> Reconcile {
+    let Some(cli) = cli else {
+        return Reconcile::Foreign;
+    };
+    let same_uuid = matches!((cli_uuid, my_uuid), (Some(a), Some(b)) if a == b);
+    if !cli.same_lineage(mine) && !same_uuid {
+        Reconcile::Foreign
+    } else if cli.access_token == mine.access_token {
+        Reconcile::Active
+    } else if cli.expires_at > mine.expires_at {
+        Reconcile::Adopt(cli.clone())
+    } else {
+        Reconcile::Behind
+    }
 }
 
 /// Refresh before the lead time, or because a 401 asked for it. An unparseable
@@ -322,13 +366,12 @@ mod tests {
     }
 
     fn cred(expires_at: i64) -> Credential {
-        Credential {
-            v: 1,
-            access_token: FAKE_ACCESS.into(),
-            refresh_token: FAKE_REFRESH.into(),
+        Credential::new(
+            FAKE_ACCESS,
+            FAKE_REFRESH,
             expires_at,
-            scopes: vec!["user:inference".into(), "user:profile".into()],
-        }
+            vec!["user:inference".into(), "user:profile".into()],
+        )
     }
 
     fn refreshed(refresh_token: Option<&str>) -> Refreshed {
@@ -785,5 +828,71 @@ mod tests {
         assert_eq!(step, Step::Normal);
         assert_eq!(poll.attempt, 0);
         assert_eq!(poll.last_success, Some(now));
+    }
+
+    fn with_tokens(access: &str, refresh: &str, expires_at: i64) -> Credential {
+        Credential::new(access, refresh, expires_at, vec![])
+    }
+
+    #[test]
+    fn reconcile_an_empty_or_foreign_store_is_foreign() {
+        let mine = with_tokens(FAKE_ACCESS, FAKE_REFRESH, 100);
+        assert_eq!(reconcile(None, None, &mine, Some("u1")), Reconcile::Foreign);
+        let other = with_tokens(FAKE_ACCESS_2, FAKE_REFRESH_2, 900);
+        assert_eq!(
+            reconcile(Some(&other), Some("u2"), &mine, Some("u1")),
+            Reconcile::Foreign
+        );
+        // Unknown identity on either side and no shared token: not ours.
+        assert_eq!(
+            reconcile(Some(&other), None, &mine, Some("u1")),
+            Reconcile::Foreign
+        );
+        assert_eq!(
+            reconcile(Some(&other), Some("u1"), &mine, None),
+            Reconcile::Foreign
+        );
+    }
+
+    #[test]
+    fn reconcile_the_same_token_is_active_and_a_newer_one_is_adopted() {
+        let mine = with_tokens(FAKE_ACCESS, FAKE_REFRESH, 100);
+        assert_eq!(reconcile(Some(&mine), None, &mine, None), Reconcile::Active);
+        // The CLI refreshed: new access token, same refresh token, later expiry.
+        let refreshed = with_tokens(FAKE_ACCESS_2, FAKE_REFRESH, 900);
+        assert_eq!(
+            reconcile(Some(&refreshed), None, &mine, None),
+            Reconcile::Adopt(refreshed.clone())
+        );
+        // The CLI refreshed and the refresh token rotated too; only the uuid
+        // still ties the two together.
+        let rotated = with_tokens(FAKE_ACCESS_2, FAKE_REFRESH_2, 900);
+        assert_eq!(
+            reconcile(Some(&rotated), Some("u1"), &mine, Some("u1")),
+            Reconcile::Adopt(rotated.clone())
+        );
+    }
+
+    #[test]
+    fn reconcile_an_older_copy_of_ours_is_behind() {
+        let mine = with_tokens(FAKE_ACCESS_2, FAKE_REFRESH, 900);
+        let stale = with_tokens(FAKE_ACCESS, FAKE_REFRESH, 100);
+        assert_eq!(
+            reconcile(Some(&stale), None, &mine, None),
+            Reconcile::Behind
+        );
+    }
+
+    /// After a reconnect the CLI may still hold the account's old, dead
+    /// lineage: same uuid, earlier expiry. Taking it back would undo the
+    /// reconnect; it is ours to overwrite instead.
+    #[test]
+    fn reconcile_an_older_grant_of_the_same_account_is_behind_not_adopted() {
+        let mine = with_tokens(FAKE_ACCESS, FAKE_REFRESH, 900);
+        let dead = with_tokens(FAKE_ACCESS_2, FAKE_REFRESH_2, 100);
+        assert_eq!(
+            reconcile(Some(&dead), Some("u1"), &mine, Some("u1")),
+            Reconcile::Behind
+        );
     }
 }

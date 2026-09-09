@@ -1,5 +1,6 @@
 //! Credential storage. The daemon owns its own tokens and stores one JSON
-//! `Credential` blob per account; it never reads Claude Code's store (plan §5).
+//! `Credential` blob per account, apart from Claude Code's own store — that
+//! one is `cuw-switch`'s, touched only to switch accounts (plan §5).
 //! `keyring` covers both platforms: `windows-native` is Credential Manager, and
 //! `apple-native` calls Security.framework in-process from our own binary —
 //! which is what plan §5 asks for, so there is no macOS native impl to drop to.
@@ -13,7 +14,7 @@ pub mod windows;
 
 use std::sync::OnceLock;
 
-use cuw_core::{CliToken, Credential};
+use cuw_core::Credential;
 
 const SERVICE: &str = "com.local.cuw";
 
@@ -30,13 +31,12 @@ const MAX_BLOB_UTF16_BYTES: Option<usize> = if cfg!(windows) { Some(2560) } else
 /// The only blob shape this build understands; anything else is `Corrupt`.
 const BLOB_VERSION: u8 = 1;
 
-/// Suffix for the second, independent credential: the CLI's `setup-token`
-/// grant (SWITCHER §3). A different key means a `get` can never hand the login
-/// credential to the session route by mistake.
+/// Suffix an earlier build stored a second, `setup-token` grant under. Nothing
+/// writes one any more; the key survives only so leftovers can be removed.
 const CLI_SUFFIX: &str = "#cli";
 
-/// The store key for an account's CLI token. `#` never appears in an id
-/// (`make_id` emits `[a-z0-9-]` only), so the two namespaces cannot collide.
+/// The store key of an account's leftover CLI token. `#` never appears in an
+/// id (`make_id` emits `[a-z0-9-]` only), so the namespaces cannot collide.
 pub fn cli_key(id: &str) -> String {
     format!("{id}{CLI_SUFFIX}")
 }
@@ -78,11 +78,8 @@ pub trait CredentialStore: Send + Sync {
     fn get(&self, id: &str) -> Result<Credential, CredError>;
     fn delete(&self, id: &str) -> Result<(), CredError>;
 
-    /// The CLI token, under [`cli_key`]. Absent is ordinary — an account that
-    /// never captured one shows `switch unavailable` (SWITCHER §6), so this
-    /// returns `NotFound` rather than being an error state.
-    fn put_cli(&self, id: &str, tok: &CliToken) -> Result<(), CredError>;
-    fn get_cli(&self, id: &str) -> Result<CliToken, CredError>;
+    /// Remove a leftover `setup-token` grant under [`cli_key`]. `NotFound` is
+    /// the ordinary answer.
     fn delete_cli(&self, id: &str) -> Result<(), CredError>;
 }
 
@@ -104,21 +101,6 @@ pub(crate) fn decode(id: &str, r: Result<String, keyring::Error>) -> Result<Cred
         return Err(CredError::Corrupt(id.into()));
     }
     Ok(cred)
-}
-
-/// [`decode`] for the CLI token. A blob that parses as a `Credential` would not
-/// parse here — the fields differ — so a key mix-up surfaces as `Corrupt`
-/// rather than as the wrong secret.
-pub(crate) fn decode_cli(
-    id: &str,
-    r: Result<String, keyring::Error>,
-) -> Result<CliToken, CredError> {
-    let s = read_blob(id, r)?;
-    let tok: CliToken = serde_json::from_str(&s).map_err(|_| CredError::Corrupt(id.into()))?;
-    if tok.v != BLOB_VERSION || tok.token.is_empty() {
-        return Err(CredError::Corrupt(id.into()));
-    }
-    Ok(tok)
 }
 
 /// The backend read, with the two error shapes that must never carry bytes
@@ -154,26 +136,22 @@ impl CredentialStore for KeyringStore {
     }
 
     fn delete(&self, id: &str) -> Result<(), CredError> {
-        Self::entry(id)?.delete_credential()?;
-        Ok(())
-    }
-
-    fn put_cli(&self, id: &str, tok: &CliToken) -> Result<(), CredError> {
-        let key = cli_key(id);
-        let s = serde_json::to_string(tok).map_err(|_| CredError::Corrupt(key.clone()))?;
-        check_size(&key, &s)?;
-        Self::entry(&key)?.set_password(&s)?;
-        Ok(())
-    }
-
-    fn get_cli(&self, id: &str) -> Result<CliToken, CredError> {
-        let key = cli_key(id);
-        decode_cli(&key, Self::entry(&key)?.get_password())
+        deleted(id, Self::entry(id)?.delete_credential())
     }
 
     fn delete_cli(&self, id: &str) -> Result<(), CredError> {
-        Self::entry(&cli_key(id))?.delete_credential()?;
-        Ok(())
+        let key = cli_key(id);
+        deleted(&key, Self::entry(&key)?.delete_credential())
+    }
+}
+
+/// A delete of an absent entry is `NotFound`, the ordinary answer the callers
+/// match on, not a backend error.
+fn deleted(id: &str, r: Result<(), keyring::Error>) -> Result<(), CredError> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Err(CredError::NotFound(id.into())),
+        Err(e) => Err(CredError::Backend(e)),
     }
 }
 
@@ -193,13 +171,16 @@ mod tests {
             }
             s
         };
-        Credential {
-            v: 1,
-            access_token: pad("sk-ant-oat01-FAKE"),
-            refresh_token: pad("sk-ant-ort01-FAKE"),
-            expires_at: 1_756_600_000,
-            scopes: vec!["user:inference".into(), "user:profile".into()],
-        }
+        let mut c = Credential::new(
+            pad("sk-ant-oat01-FAKE"),
+            pad("sk-ant-ort01-FAKE"),
+            1_756_600_000,
+            vec!["user:inference".into(), "user:profile".into()],
+        );
+        c.subscription_type = Some("max".into());
+        c.rate_limit_tier = Some("default_claude_max_20x".into());
+        c.refresh_token_expires_at = Some(1_759_000_000);
+        c
     }
 
     /// Round-trips a throwaway entry through the real OS keyring. Ignored so CI
@@ -219,38 +200,11 @@ mod tests {
         assert_eq!(got.refresh_token, cred.refresh_token);
         assert_eq!(got.expires_at, cred.expires_at);
         assert_eq!(got.scopes, cred.scopes);
+        assert_eq!(got.subscription_type, cred.subscription_type);
+        assert_eq!(got.refresh_token_expires_at, cred.refresh_token_expires_at);
 
         store.delete(&id).expect("delete");
         assert!(matches!(store.get(&id), Err(CredError::NotFound(_))));
-    }
-
-    /// The CLI token round-trips under its own key and is deleted independently
-    /// of the login credential (SWITCHER §3).
-    #[test]
-    #[ignore]
-    fn keyring_cli_token_round_trip_is_independent() {
-        let store = KeyringStore;
-        let id = format!("cuw-cli-roundtrip-{}", std::process::id());
-        let cred = fake(40);
-        let tok = CliToken::new("sk-ant-oat01-FAKECLI0000000000000000", now());
-
-        store.put(&id, &cred).expect("put");
-        store.put_cli(&id, &tok).expect("put_cli");
-
-        let got = store.get_cli(&id).expect("get_cli");
-        assert_eq!(got.token, tok.token);
-        assert_eq!(got.captured_at, tok.captured_at);
-
-        // Dropping the CLI token leaves the login credential alone.
-        store.delete_cli(&id).expect("delete_cli");
-        assert!(matches!(store.get_cli(&id), Err(CredError::NotFound(_))));
-        assert!(store.get(&id).is_ok());
-
-        store.delete(&id).expect("delete");
-    }
-
-    fn now() -> time::OffsetDateTime {
-        time::OffsetDateTime::from_unix_timestamp(1_756_600_000).unwrap()
     }
 
     #[test]
@@ -259,47 +213,6 @@ mod tests {
         // Ids come from `make_id`, which emits `[a-z0-9-]` only, so no id can
         // ever collide with another id's CLI key.
         assert!(!"work-abc12345".contains('#'));
-    }
-
-    #[test]
-    fn a_login_blob_never_decodes_as_a_cli_token() {
-        let blob = serde_json::to_string(&fake(40)).expect("serialize");
-        assert!(matches!(
-            decode_cli("work-abc12345#cli", Ok(blob)),
-            Err(CredError::Corrupt(_))
-        ));
-    }
-
-    #[test]
-    fn a_cli_blob_never_decodes_as_a_login_credential() {
-        let blob = serde_json::to_string(&CliToken::new("sk-ant-oat01-FAKE", now())).unwrap();
-        assert!(matches!(decode("x", Ok(blob)), Err(CredError::Corrupt(_))));
-    }
-
-    #[test]
-    fn an_empty_or_wrong_version_cli_token_is_corrupt() {
-        for blob in [
-            r#"{"v":1,"token":"","captured_at":1756600000}"#,
-            r#"{"v":2,"token":"sk-ant-oat01-FAKE","captured_at":1756600000}"#,
-            "not json at all",
-        ] {
-            assert!(
-                matches!(decode_cli("x", Ok(blob.into())), Err(CredError::Corrupt(_))),
-                "{blob}"
-            );
-        }
-        assert!(matches!(
-            decode_cli("x", Err(keyring::Error::NoEntry)),
-            Err(CredError::NotFound(_))
-        ));
-    }
-
-    #[test]
-    fn cli_token_debug_is_redacted() {
-        let tok = CliToken::new("sk-ant-oat01-FAKECLI0000000000000000", now());
-        let text = format!("{tok:?}");
-        assert!(!text.contains("FAKECLI"), "{text}");
-        assert!(text.contains("sk-a…"), "{text}");
     }
 
     /// Two tokens far longer than the real ones still fit Windows' blob cap, so
@@ -375,6 +288,15 @@ mod tests {
             decode("x", Ok(r#"{"v":1}"#.into())),
             Err(CredError::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn deleting_an_absent_entry_is_not_found() {
+        assert!(matches!(
+            deleted("x", Err(keyring::Error::NoEntry)),
+            Err(CredError::NotFound(id)) if id == "x"
+        ));
+        assert!(deleted("x", Ok(())).is_ok());
     }
 
     #[test]

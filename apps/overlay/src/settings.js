@@ -573,55 +573,6 @@ function buildDocking(pane) {
   );
 }
 
-// --- Sessions ---------------------------------------------------------------
-
-// A terminal override is argv, one argument per line, never re-split (SWITCHER
-// §5) — so a path with spaces survives the round trip through the box.
-function argvText(argv) {
-  return (Array.isArray(argv) ? argv : []).filter((a) => typeof a === "string").join("\n");
-}
-
-function parseArgv(text) {
-  return String(text)
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
-}
-
-function buildSessions(pane) {
-  const sess = () => settings.session || {};
-  const cwd = textInput(
-    () => (typeof sess().cwd === "string" ? sess().cwd : ""),
-    (v) => patch({ session: { cwd: v.trim() } }),
-    { placeholder: "(your home directory)", mono: true },
-  );
-  const term = textarea(
-    () => argvText(sess().terminal),
-    (v) => patch({ session: { terminal: parseArgv(v) } }),
-    isMac() ? "open\n-a\niTerm" : "wt.exe\n-d\n{cwd}",
-  );
-  pane.append(
-    el("div", "lead", "How a switched session starts when you press ▸ on an account."),
-    group(
-      "Terminal",
-      row("Start directory", "Where the new session opens.", cwd, { stack: true }),
-      row(
-        "Terminal command",
-        // The fold rule diverges by platform on purpose (cuw-launch plan.rs):
-        // on Windows an override is a prefix unless it names {shim}; on macOS
-        // the default is `open -a Terminal <wrapper>`, so prefixing it is
-        // nonsense and a plain override is a launcher the wrapper is
-        // appended to instead.
-        isMac()
-          ? "One argument per line. Blank uses Terminal.app. {wrapper} {shim} {nonce} {port} {cwd} substitute; a command naming any of them is used as written, anything else is a launcher the wrapper is appended to (open -a iTerm)."
-          : "One argument per line. Blank uses the default terminal. {shim} {nonce} {port} {cwd} substitute; a command containing {shim} replaces the default, anything else prefixes it.",
-        term,
-        { stack: true },
-      ),
-    ),
-  );
-}
-
 // --- About ------------------------------------------------------------------
 
 function buildAbout(pane) {
@@ -724,7 +675,8 @@ function buildAbout(pane) {
       keysRow,
       row(
         "Usage view",
-        "Connect, disconnect and switch accounts from the usage view itself, not from here.",
+        "Connect, disconnect and switch accounts from the usage view itself, not from here. " +
+          "Switching signs every claude in as that account, the way /login does.",
       ),
     ),
   );
@@ -736,7 +688,6 @@ const TABS = [
   { id: "general", title: "General", glyph: "⚙", build: buildGeneral },
   { id: "appearance", title: "Appearance", glyph: "◐", build: buildAppearance },
   { id: "docking", title: "Docking", glyph: "⌖", build: buildDocking, when: dockingSupported },
-  { id: "sessions", title: "Sessions", glyph: "❯", build: buildSessions },
   { id: "about", title: "About", glyph: "ⓘ", build: buildAbout },
 ];
 

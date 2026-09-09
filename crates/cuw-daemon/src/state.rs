@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use cuw_core::model::AccountState;
 use serde::Serialize;
+use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::{broadcast, RwLock};
 
@@ -30,10 +31,11 @@ pub struct Row {
     /// A rotated credential could not be written to the OS store; the row keeps
     /// working from memory but needs a reconnect after a restart.
     pub persist_pending: bool,
-    /// A `<id>#cli` grant exists, so the row can offer the switch button. False
-    /// is `switch unavailable`, a display state fixed by a reconnect
-    /// (SWITCHER §6).
-    pub can_switch: bool,
+    /// The CLI's `oauthAccount` block for this login, when the connect caught
+    /// it: uuid, email, org — identity, never a secret. A switch writes it
+    /// into the CLI's config, and the poll loop keys on its uuid to tell a
+    /// token the CLI rotated from another account's.
+    pub account: Option<Value>,
 }
 
 impl Row {
@@ -49,8 +51,22 @@ impl Row {
             stale: false,
             last_ok_at: None,
             persist_pending: false,
-            can_switch: false,
+            account: None,
         }
+    }
+
+    /// The account uuid, if the identity block was captured.
+    pub fn account_uuid(&self) -> Option<&str> {
+        self.account.as_ref().and_then(cuw_switch::account_uuid)
+    }
+
+    /// The account email, for the overlay's tooltip.
+    pub fn email(&self) -> Option<&str> {
+        self.account
+            .as_ref()
+            .and_then(|a| a.get("emailAddress"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -102,7 +118,11 @@ pub struct WireAccount {
     pub refreshed_at: Option<String>,
     pub refresh: &'static str,
     pub persist_pending: bool,
-    pub can_switch: bool,
+    /// The CLI's store currently holds this account: every `claude` is
+    /// signed in as it.
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 fn fmt(dt: OffsetDateTime) -> Option<String> {
@@ -116,7 +136,7 @@ pub fn parse_rfc3339(s: &str) -> Option<OffsetDateTime> {
 
 /// Project a `Row` into its wire form. Percentages are rounded to integers to
 /// match the overlay's `${a.five_hour}%` rendering.
-pub fn to_wire(id: &str, row: &Row) -> WireAccount {
+pub fn to_wire(id: &str, row: &Row, active: bool) -> WireAccount {
     let (state, five_hour, seven_day, resets_at, seven_day_resets_at, scoped) = match &row.state {
         AccountState::Available(u) => (
             "available",
@@ -153,16 +173,22 @@ pub fn to_wire(id: &str, row: &Row) -> WireAccount {
         refreshed_at: row.refreshed_at.and_then(fmt),
         refresh: row.refresh.as_wire(),
         persist_pending: row.persist_pending,
-        can_switch: row.can_switch,
+        active,
+        email: row.email().map(str::to_string),
     }
 }
 
 /// Every account, oldest connection first, as the wire array `GET /accounts`
-/// returns and `/events` pushes.
-pub fn snapshot(rows: &HashMap<String, Row>) -> Vec<WireAccount> {
+/// returns and `/events` pushes. `active` is the id the CLI's store holds.
+pub fn snapshot(rows: &HashMap<String, Row>, active: Option<&str>) -> Vec<WireAccount> {
     let mut out: Vec<(OffsetDateTime, WireAccount)> = rows
         .iter()
-        .map(|(id, row)| (row.connected_at, to_wire(id, row)))
+        .map(|(id, row)| {
+            (
+                row.connected_at,
+                to_wire(id, row, active == Some(id.as_str())),
+            )
+        })
         .collect();
     out.sort_by_key(|(t, _)| *t);
     out.into_iter().map(|(_, w)| w).collect()
@@ -176,7 +202,7 @@ mod tests {
     fn wire_carries_refresh_fields_and_no_secret() {
         let connected_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let row = Row::new("Work".into(), AccountState::Unavailable, connected_at);
-        let text = serde_json::to_string(&to_wire("work-abc12345", &row)).unwrap();
+        let text = serde_json::to_string(&to_wire("work-abc12345", &row, false)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
 
         for key in [
@@ -187,12 +213,13 @@ mod tests {
             "refreshed_at",
             "refresh",
             "persist_pending",
-            "can_switch",
+            "active",
         ] {
             assert!(v.get(key).is_some(), "{key} must always be present");
         }
         assert_eq!(v["refresh"], "ok");
-        assert_eq!(v["can_switch"], false, "no CLI token until one is stored");
+        assert_eq!(v["active"], false);
+        assert!(v.get("email").is_none(), "no identity block, no email key");
         assert_eq!(v["stale"], false);
         assert_eq!(v["persist_pending"], false);
         assert!(v["scoped"].is_array());
@@ -205,6 +232,25 @@ mod tests {
         let connected_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let mut row = Row::new("Work".into(), AccountState::Unavailable, connected_at);
         row.stale = true;
-        assert!(!to_wire("id", &row).stale);
+        assert!(!to_wire("id", &row, false).stale);
+    }
+
+    #[test]
+    fn the_identity_block_yields_uuid_and_email_and_marks_the_active_row() {
+        let connected_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let mut row = Row::new("Work".into(), AccountState::Unavailable, connected_at);
+        row.account = Some(serde_json::json!({
+            "accountUuid": "u-1", "emailAddress": "a@example.com", "organizationRole": "admin"
+        }));
+        assert_eq!(row.account_uuid(), Some("u-1"));
+        assert_eq!(row.email(), Some("a@example.com"));
+
+        let mut rows = HashMap::new();
+        rows.insert("work-abc12345".to_string(), row);
+        let wire = snapshot(&rows, Some("work-abc12345"));
+        assert!(wire[0].active);
+        assert_eq!(wire[0].email.as_deref(), Some("a@example.com"));
+        let wire = snapshot(&rows, Some("someone-else"));
+        assert!(!wire[0].active);
     }
 }

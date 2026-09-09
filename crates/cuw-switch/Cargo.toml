@@ -1,0 +1,18 @@
+[package]
+name = "cuw-switch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cuw-core.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+sha2 = "0.10"
+directories = "5"
+
+# `getpwuid_r`: the Keychain item is keyed by account name, and the CLI uses
+# the passwd entry, not `$USER`.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

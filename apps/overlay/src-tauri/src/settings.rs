@@ -33,7 +33,6 @@ pub struct Settings {
     pub show_scoped: bool,
     pub colors: BTreeMap<String, String>,
     pub dock: Dock,
-    pub session: Session,
 }
 
 /// Where the usage lives. `MenuBar`: no floating widget; the tray (menu bar)
@@ -45,16 +44,6 @@ pub enum Mode {
     #[default]
     MenuBar,
     Widget,
-}
-
-/// How a switched session is started (SWITCHER §5). `terminal` is argv, never a
-/// shell string, so a path with spaces cannot come apart; empty means the
-/// platform default. Empty `cwd` leaves the directory to the daemon.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
-#[serde(default)]
-pub struct Session {
-    pub terminal: Vec<String>,
-    pub cwd: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,7 +109,6 @@ pub struct SettingsPatch {
     pub show_scoped: Option<bool>,
     pub colors: Option<BTreeMap<String, String>>,
     pub dock: Option<DockPatch>,
-    pub session: Option<SessionPatch>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -133,13 +121,6 @@ pub struct DockPatch {
     pub follow_focus: Option<bool>,
     pub allow: Option<Vec<AllowSpec>>,
     pub show_accessibility_hint: Option<bool>,
-}
-
-#[derive(Deserialize, Default, Debug)]
-#[serde(default)]
-pub struct SessionPatch {
-    pub terminal: Option<Vec<String>>,
-    pub cwd: Option<String>,
 }
 
 impl Default for Settings {
@@ -156,7 +137,6 @@ impl Default for Settings {
             show_scoped: true,
             colors: BTreeMap::new(),
             dock: Dock::default(),
-            session: Session::default(),
         }
     }
 }
@@ -292,10 +272,6 @@ pub fn validate(mut s: Settings) -> Settings {
         *t = Thresholds::default();
     }
     s.colors.retain(|_, v| is_hex_color(v));
-    // A blank argv entry would be passed to the terminal as an empty argument;
-    // the textarea produces one for every stray line.
-    s.session.terminal.retain(|a| !a.trim().is_empty());
-    s.session.cwd = s.session.cwd.trim().to_string();
     s
 }
 
@@ -319,7 +295,6 @@ pub fn merge(base: &mut Settings, patch: SettingsPatch) {
         show_scoped,
         colors,
         dock,
-        session,
     } = patch;
     if let Some(v) = mode {
         base.mode = v;
@@ -369,14 +344,6 @@ pub fn merge(base: &mut Settings, patch: SettingsPatch) {
         }
         if let Some(v) = d.show_accessibility_hint {
             base.dock.show_accessibility_hint = v;
-        }
-    }
-    if let Some(s) = session {
-        if let Some(v) = s.terminal {
-            base.session.terminal = v;
-        }
-        if let Some(v) = s.cwd {
-            base.session.cwd = v;
         }
     }
 }
@@ -534,45 +501,15 @@ mod tests {
         assert_eq!(validate(inverted).thresholds, Thresholds::default());
     }
 
+    /// A settings file written when there was a Sessions tab still loads; the
+    /// key is simply ignored.
     #[test]
-    fn session_defaults_to_the_platform_terminal_and_home() {
-        let s = Settings::default();
-        assert!(s.session.terminal.is_empty());
-        assert!(s.session.cwd.is_empty());
-        // An older file predating the switcher still loads.
-        let old: Settings = serde_json::from_str(r#"{"version":1,"compact":true}"#).unwrap();
-        assert_eq!(old.session, Session::default());
-    }
-
-    #[test]
-    fn validate_drops_blank_terminal_args() {
-        let v = validate(Settings {
-            session: Session {
-                terminal: vec!["wt.exe".into(), "  ".into(), String::new(), "-w".into()],
-                cwd: "  D:/src  ".into(),
-            },
-            ..Settings::default()
-        });
-        assert_eq!(v.session.terminal, vec!["wt.exe", "-w"]);
-        assert_eq!(v.session.cwd, "D:/src");
-    }
-
-    #[test]
-    fn merge_applies_session_fields_independently() {
-        let mut base = Settings::default();
-        base.session.cwd = "D:/keep".into();
-        merge(
-            &mut base,
-            SettingsPatch {
-                session: Some(SessionPatch {
-                    terminal: Some(vec!["wt.exe".into()]),
-                    ..SessionPatch::default()
-                }),
-                ..SettingsPatch::default()
-            },
-        );
-        assert_eq!(base.session.terminal, vec!["wt.exe"]);
-        assert_eq!(base.session.cwd, "D:/keep");
+    fn a_file_with_the_old_session_block_still_loads() {
+        let old: Settings = serde_json::from_str(
+            r#"{"version":1,"compact":true,"session":{"terminal":["wt.exe"],"cwd":"D:/src"}}"#,
+        )
+        .unwrap();
+        assert!(old.compact);
     }
 
     #[test]

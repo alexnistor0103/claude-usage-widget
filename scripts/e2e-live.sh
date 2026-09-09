@@ -89,8 +89,7 @@ stop_widget() {
 }
 
 # Builds a curl config on stdout. The bearer goes in here, never on the argv
-# where `ps` would show it to any process in the session (same trick as the
-# session shim).
+# where `ps` would show it to any process in the session.
 req_config() { # method path body_file|'' auth|noauth
     printf 'url = "http://127.0.0.1:%s%s"\n' "$port" "$2"
     printf 'request = "%s"\n' "$1"
@@ -285,7 +284,7 @@ else
     while IFS= read -r row; do
         case $row in *'"id":'*) ;; *) continue ;; esac
         seen=$((seen + 1))
-        for k in stale fetched_at scoped access_expires_at refreshed_at refresh persist_pending can_switch; do
+        for k in stale fetched_at scoped access_expires_at refreshed_at refresh persist_pending active; do
             case $row in *"\"$k\":"*) ;; *) wire_ok=no; why="row missing '$k'" ;; esac
         done
         case $row in *'"expires_at":'*) wire_ok=no; why="row still carries 'expires_at'" ;; esac
@@ -298,32 +297,28 @@ else
 fi
 if [ "$wire_ok" = yes ]; then report auth-wire PASS "$why"; else report auth-wire FAIL "$why"; fi
 
-# --- 3b. Session routes (M7.2) ----------------------------------------------
-# No live login needed: an unknown account, an unminted code and a missing
-# bearer are all answerable without one. The one thing never asserted here is a
-# real token - the script must not be able to print one.
+# --- 3b. Switch route ---------------------------------------------------------
+# No live login needed: an unknown account and a missing bearer are both
+# answerable without one, and neither may ever touch the CLI's own store. The
+# one thing never asserted here is a real token - the script must not be able
+# to print one.
 
-request GET /session/0123456789abcdef0123456789abcdef '' noauth
-sess_noauth=$status
-request GET /session/0123456789abcdef0123456789abcdef ''
-sess_unknown=$status
-cp "$body_file" "$tmp/session-unknown.body"
-request POST /accounts/no-such-account/session '{}'
+request POST /accounts/no-such-account/switch '' noauth
+switch_noauth=$status
+request POST /accounts/no-such-account/switch ''
 switch_unknown=$status
 
-session_ok=yes
-if [ "$sess_noauth" != 401 ]; then
-    session_ok=no; why="unauthenticated redeem gave $sess_noauth, want 401"
-elif [ "$sess_unknown" != 404 ]; then
-    session_ok=no; why="unknown code gave $sess_unknown, want 404"
+switch_ok=yes
+if [ "$switch_noauth" != 401 ]; then
+    switch_ok=no; why="unauthenticated switch gave $switch_noauth, want 401"
 elif [ "$switch_unknown" != 404 ]; then
-    session_ok=no; why="switch on an unknown account gave $switch_unknown, want 404"
-elif grep -q 'sk-ant' "$tmp/session-unknown.body" "$body_file"; then
-    session_ok=no; why='a refusal body contains a token prefix'
+    switch_ok=no; why="switch on an unknown account gave $switch_unknown, want 404"
+elif grep -q 'sk-ant' "$body_file"; then
+    switch_ok=no; why='a refusal body contains a token prefix'
 else
-    why='redeem needs the bearer; unknown code and unknown account both 404'
+    why='switch needs the bearer; an unknown account is 404'
 fi
-if [ "$session_ok" = yes ]; then report session PASS "$why"; else report session FAIL "$why"; fi
+if [ "$switch_ok" = yes ]; then report switch PASS "$why"; else report switch FAIL "$why"; fi
 
 # --- 4. SSE first frame -----------------------------------------------------
 

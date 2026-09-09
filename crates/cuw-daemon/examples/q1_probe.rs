@@ -163,37 +163,8 @@ fn relative(expires_at: i64) -> String {
 fn read_cred_file(path: &Path) -> anyhow::Result<Credential> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let v: Value = serde_json::from_str(&text).context("parse json")?;
-    let o = v
-        .get("claudeAiOauth")
-        .context("no claudeAiOauth key — is this a CLI credentials file?")?;
-    let s = |k: &str| {
-        o.get(k)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    };
-    let expires_at = o.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
-    Ok(Credential {
-        v: 1,
-        access_token: s("accessToken"),
-        refresh_token: s("refreshToken"),
-        // The CLI writes milliseconds; the daemon's model is seconds.
-        expires_at: if expires_at > 100_000_000_000 {
-            expires_at / 1000
-        } else {
-            expires_at
-        },
-        scopes: o
-            .get("scopes")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default(),
-    })
+    Credential::from_cli_json(&v)
+        .context("no usable claudeAiOauth block — is this a CLI credentials file?")
 }
 
 /// Write back in the CLI's own shape, preserving any other keys in the file.

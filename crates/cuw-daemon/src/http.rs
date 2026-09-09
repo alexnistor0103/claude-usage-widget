@@ -5,24 +5,23 @@
 //!   POST   /accounts               → run the connect flow, then poll without a restart
 //!   POST   /accounts/:id/reconnect → re-run the login for an existing account
 //!   DELETE /accounts/:id           → stop polling, forget the account, drop its credential
-//!   POST   /accounts/:id/session   → mint a launch code and open a terminal as that account
-//!   GET    /session/:nonce         → the shim redeems the code for the CLI token
+//!   POST   /accounts/:id/switch    → make this account the one every `claude` uses
 //!   POST   /shutdown               → ask the daemon to exit gracefully
 //!   GET    /events                 → SSE: a frame on every state change and connect step
 //!
-//! `GET /session/:nonce` is the one route that returns a token, and the one
-//! bounded exception to plan §5 — a *different* credential (`<id>#cli`, scope
-//! `user:inference`), single-use, 30 s TTL, never logged (SWITCHER §6).
+//! No route returns a token. A switch writes the account's credential into
+//! the CLI's own store (cuw-switch) — the daemon-to-CLI handoff `/login`
+//! itself performs — and the poll loop keeps the two stores in step from then
+//! on, so a token the CLI rotates is adopted and one the daemon rotates is
+//! written back.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::extract::{Path, Request, State};
-use axum::http::{header::AUTHORIZATION, header::CACHE_CONTROL, HeaderValue, StatusCode};
+use axum::http::{header::AUTHORIZATION, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -35,22 +34,21 @@ use cuw_core::model::AccountState;
 use cuw_core::refresh::TokenRefresher;
 use cuw_core::Credential;
 use cuw_creds::{CredError, CredentialStore};
-use cuw_launch::{LaunchRequest, SessionLauncher};
+use cuw_switch::CliStore;
 use serde::Deserialize;
 use serde_json::json;
 use time::OffsetDateTime;
-use tokio::sync::{broadcast, mpsc, Mutex, Notify};
+use tokio::sync::{broadcast, mpsc, Mutex, Notify, RwLock};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 use tower_http::cors::CorsLayer;
 
 use crate::poll::{
-    apply_fetch, apply_refresh, fingerprint, needs_refresh, refresh_backoff, sleep_crosses_stale,
-    PollState, RefreshStatus, RefreshStep, Step,
+    apply_fetch, apply_refresh, fingerprint, needs_refresh, reconcile, refresh_backoff,
+    sleep_crosses_stale, PollState, Reconcile, RefreshStatus, RefreshStep, Step,
 };
 use crate::registry::{RegAccount, Registry};
-use crate::session::Nonces;
 use crate::state::{self, Row, SharedRows, SseMsg};
 
 /// A cloneable `UsageSource` handle. Needed because `connect()` and the poll
@@ -101,17 +99,16 @@ pub struct AppState {
     /// Abort handle for the in-flight connect task, so shutdown can kill the
     /// CLI and scrub the scratch dir instead of orphaning them.
     pub connect_task: Arc<Mutex<Option<AbortHandle>>>,
-    /// Outstanding session-launch codes (SWITCHER §4).
-    pub sessions: Arc<Mutex<Nonces>>,
-    /// Opens the terminal a launch code is spent in. Behind a trait like the
-    /// usage source, so macOS is a one-impl swap (M7.4).
-    pub launcher: Arc<dyn SessionLauncher>,
-    /// The port the listener actually bound, published here after the bind so
-    /// the shim is told where to redeem rather than assuming a default. `0`
-    /// until then, which refuses a launch instead of pointing it nowhere.
-    pub port: Arc<AtomicU16>,
-    /// Where a launched session starts when the caller names no directory.
-    pub default_cwd: Arc<PathBuf>,
+    /// The CLI's own credential store, behind a trait so tests never touch a
+    /// real login. Every access goes through `spawn_blocking`: on macOS it is
+    /// a `security` process.
+    pub cli: Arc<dyn CliStore>,
+    /// The account the CLI's store was last seen holding, if it is one of
+    /// ours. Set by a switch, confirmed or cleared by every poll iteration.
+    pub active: Arc<RwLock<Option<String>>>,
+    /// Held across every look-then-write at the CLI's store, so a switch and
+    /// a poll task's write-back cannot interleave and undo each other.
+    pub cli_lock: Arc<Mutex<()>>,
 }
 
 /// Build the router: every route behind the bearer gate, permissive CORS on the
@@ -125,8 +122,7 @@ pub fn router(app: AppState) -> Router {
             "/accounts/:id/reconnect",
             axum::routing::post(reconnect_account),
         )
-        .route("/accounts/:id/session", axum::routing::post(start_session))
-        .route("/session/:nonce", get(redeem_session))
+        .route("/accounts/:id/switch", axum::routing::post(switch_account))
         .route("/shutdown", axum::routing::post(shutdown))
         .route("/events", get(events))
         .layer(middleware::from_fn_with_state(app.clone(), require_bearer))
@@ -152,8 +148,31 @@ async fn require_bearer(State(app): State<AppState>, req: Request, next: Next) -
 }
 
 async fn list_accounts(State(app): State<AppState>) -> Json<Vec<state::WireAccount>> {
+    Json(snapshot(&app).await)
+}
+
+/// The wire array under both locks, rows first, active second; each is held
+/// briefly and never across an await.
+async fn snapshot(app: &AppState) -> Vec<state::WireAccount> {
+    let active = app.active.read().await.clone();
     let rows = app.rows.read().await;
-    Json(state::snapshot(&rows))
+    state::snapshot(&rows, active.as_deref())
+}
+
+/// Record whether the CLI's store holds `id`. Returns true when that changed
+/// what the overlay shows, so the caller can broadcast.
+pub async fn set_active(app: &AppState, id: &str, is_active: bool) -> bool {
+    let mut active = app.active.write().await;
+    let was = active.as_deref() == Some(id);
+    if is_active && !was {
+        *active = Some(id.to_string());
+        true
+    } else if !is_active && was {
+        *active = None;
+        true
+    } else {
+        false
+    }
 }
 
 #[derive(Deserialize)]
@@ -208,18 +227,15 @@ async fn add_account(State(app): State<AppState>, Json(body): Json<NewAccount>) 
         )
             .into_response();
     }
-    let can_switch = store_cli_token(&app, &connected.id, connected.cli_token.as_ref());
-
     let connected_at = OffsetDateTime::now_utc();
     persist_account(
         &app,
-        RegAccount {
-            id: connected.id.clone(),
-            label: connected.label.clone(),
-            connected_at: connected_at
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default(),
-        },
+        reg_account(
+            &connected.id,
+            &connected.label,
+            connected_at,
+            connected.account.as_ref(),
+        ),
     )
     .await;
 
@@ -228,7 +244,7 @@ async fn add_account(State(app): State<AppState>, Json(body): Json<NewAccount>) 
         AccountState::Unavailable,
         connected_at,
     );
-    row.can_switch = can_switch;
+    row.account = connected.account.clone();
     app.rows.write().await.insert(connected.id.clone(), row);
 
     spawn_poll_task(
@@ -302,10 +318,10 @@ pub enum ReconnectFallback {
 /// on failure a previously healthy row resumes polling untouched — a cancelled
 /// reconnect must not kill it.
 async fn reconnect_account(State(app): State<AppState>, Path(id): Path<String>) -> Response {
-    let (label, prev_state) = {
+    let (label, prev_state, prev_account) = {
         let rows = app.rows.read().await;
         match rows.get(&id) {
-            Some(r) => (r.label.clone(), r.state.clone()),
+            Some(r) => (r.label.clone(), r.state.clone(), r.account.clone()),
             None => return StatusCode::NOT_FOUND.into_response(),
         }
     };
@@ -370,23 +386,18 @@ async fn reconnect_account(State(app): State<AppState>, Path(id): Path<String>) 
             .into_response();
     }
 
-    let can_switch = store_cli_token(&app, &id, connected.cli_token.as_ref());
-
+    // A login the CLI did not annotate in time must not erase an identity an
+    // earlier one did: it is the same account.
+    let account = connected.account.clone().or(prev_account);
     let connected_at = OffsetDateTime::now_utc();
     persist_account(
         &app,
-        RegAccount {
-            id: id.clone(),
-            label: label.clone(),
-            connected_at: connected_at
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default(),
-        },
+        reg_account(&id, &label, connected_at, account.as_ref()),
     )
     .await;
 
     let mut row = Row::new(label.clone(), AccountState::Unavailable, connected_at);
-    row.can_switch = can_switch;
+    row.account = account;
     app.rows.write().await.insert(id.clone(), row);
     spawn_poll_task(
         &app,
@@ -401,125 +412,93 @@ async fn reconnect_account(State(app): State<AppState>, Path(id): Path<String>) 
     Json(json!({ "id": id, "label": label })).into_response()
 }
 
-/// Persist the CLI token a connect captured. Returns whether the account can
-/// offer the switch button: a store failure is a display state, not a connect
-/// failure (SWITCHER §6), so it downgrades the row rather than the whole flow.
-fn store_cli_token(app: &AppState, id: &str, tok: Option<&cuw_core::CliToken>) -> bool {
-    let Some(tok) = tok else {
-        // The capture step already explained itself in the connect log; clear
-        // any stale token so the row does not offer a switch it cannot honour.
-        let _ = app.store.delete_cli(id);
-        return false;
+/// The registry entry for a connect, with the identity block when one was
+/// captured.
+fn reg_account(
+    id: &str,
+    label: &str,
+    connected_at: OffsetDateTime,
+    account: Option<&serde_json::Value>,
+) -> RegAccount {
+    let mut acc = RegAccount {
+        id: id.to_string(),
+        label: label.to_string(),
+        connected_at: connected_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+        oauth_account: None,
     };
-    match app.store.put_cli(id, tok) {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::error!(id = %id, error = %e, "store cli token");
-            false
+    acc.set_account(account);
+    acc
+}
+
+/// Make this account the one every `claude` uses: its credential goes into the
+/// CLI's own store, as `/login` would put it, and its identity block into the
+/// CLI's config when the connect captured one. Sessions already open follow,
+/// since the CLI reads its store back rather than pinning a token. The
+/// response carries no token — the overlay POSTs and gets `ok`.
+async fn switch_account(State(app): State<AppState>, Path(id): Path<String>) -> Response {
+    let account = {
+        let rows = app.rows.read().await;
+        match rows.get(&id) {
+            // The stored blob outlives a dead token; signing every `claude`
+            // in with one would only move the failure into their terminals.
+            Some(row) if matches!(row.state, AccountState::ReconnectNeeded) => {
+                return (
+                    StatusCode::CONFLICT,
+                    "this account needs a reconnect before it can be switched to",
+                )
+                    .into_response();
+            }
+            Some(row) => row.account.clone(),
+            None => return StatusCode::NOT_FOUND.into_response(),
         }
+    };
+    // The store's copy, not the poll task's: the two differ only while a
+    // persist is pending, and the next reconcile closes that gap either way.
+    let cred = match app.store.get(&id) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::info!(id = %id, error = %e, "switch refused: no stored credential");
+            return (
+                StatusCode::CONFLICT,
+                "no stored credential for this account — reconnect it first",
+            )
+                .into_response();
+        }
+    };
+
+    let cli = app.cli.clone();
+    let log_id = id.clone();
+    let guard = app.cli_lock.lock().await;
+    let written = tokio::task::spawn_blocking(move || {
+        cli.write(&cred)?;
+        // Identity is best effort: the token is what signs the CLI in, and the
+        // block only decides what `/status` prints. But the previous block
+        // must not stay: its uuid would name the account just signed out.
+        if let Err(e) = cli.write_account(account.as_ref()) {
+            tracing::warn!(id = %log_id, error = %e, "switch: identity not written");
+        }
+        Ok::<(), cuw_switch::SwitchError>(())
+    })
+    .await;
+    if matches!(written, Ok(Ok(()))) {
+        set_active(&app, &id, true).await;
     }
-}
+    drop(guard);
 
-/// What the overlay may name when it asks for a session. Both optional: the
-/// terminal override is `settings.session.terminal`, which the overlay owns
-/// (SWITCHER §5), and it is argv — never a shell string.
-#[derive(Deserialize, Default)]
-struct SessionRequest {
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    terminal: Option<Vec<String>>,
-}
-
-/// Mint a single-use launch code and open a terminal on the shim that redeems
-/// it (SWITCHER §4). The response carries no token and no nonce — the overlay
-/// POSTs and gets `ok`, which is what keeps the plan §5 invariant true for the
-/// overlay even though the switcher exists.
-async fn start_session(
-    State(app): State<AppState>,
-    Path(id): Path<String>,
-    body: Option<Json<SessionRequest>>,
-) -> Response {
-    if !app.rows.read().await.contains_key(&id) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    // Checked before a code is minted: an account that never captured a
-    // `setup-token` grant shows `switch unavailable` and needs a reconnect.
-    if let Err(e) = app.store.get_cli(&id) {
-        tracing::info!(id = %id, error = %e, "no cli token; switch unavailable");
-        return (
-            StatusCode::CONFLICT,
-            "no session token for this account — reconnect it to enable switching",
-        )
-            .into_response();
-    }
-
-    let port = app.port.load(Ordering::Relaxed);
-    if port == 0 {
-        return (StatusCode::SERVICE_UNAVAILABLE, "no bound port yet").into_response();
-    }
-
-    let Json(body) = body.unwrap_or_default();
-    let cwd = body
-        .cwd
-        .map(PathBuf::from)
-        .unwrap_or_else(|| (*app.default_cwd).clone());
-
-    let nonce = app.sessions.lock().await.mint(&id, Instant::now());
-    let req = LaunchRequest::new(nonce.clone(), port, cwd).with_terminal(body.terminal);
-
-    // The launcher writes files and calls `CreateProcessW`; keep it off the
-    // async worker.
-    let launcher = app.launcher.clone();
-    let launched = tokio::task::spawn_blocking(move || launcher.launch(req)).await;
-
-    match launched {
+    match written {
         Ok(Ok(())) => {
-            tracing::info!(id = %id, "session terminal launched");
+            broadcast_state(&app).await;
+            tracing::info!(id = %id, "switched the CLI to this account");
             Json(json!({ "ok": true })).into_response()
         }
         Ok(Err(e)) => {
-            // No terminal will ever spend it; burn it now rather than leave a
-            // live code for its whole TTL. `LaunchError` carries no nonce.
-            app.sessions.lock().await.burn(&nonce);
-            tracing::warn!(id = %id, error = %e, "session launch failed");
+            tracing::warn!(id = %id, error = %e, "switch failed");
             (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
         }
-        Err(_) => {
-            app.sessions.lock().await.burn(&nonce);
-            (StatusCode::INTERNAL_SERVER_ERROR, "launch task failed").into_response()
-        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "switch task failed").into_response(),
     }
-}
-
-/// Redeem a launch code for the account's CLI token — the one route that
-/// returns a token, and the bounded exception documented in plan §5.
-///
-/// The nonce is burned on read, whatever happens next. Unknown, spent and
-/// expired are one answer, so a caller learns nothing from the difference. Only
-/// the `<id>#cli` grant is ever served; the `user:profile` credential has a
-/// different key and no route at all.
-async fn redeem_session(State(app): State<AppState>, Path(nonce): Path<String>) -> Response {
-    let Some(id) = app.sessions.lock().await.redeem(&nonce, Instant::now()) else {
-        return (StatusCode::NOT_FOUND, "no such session code").into_response();
-    };
-
-    // Read after redemption: the token spends the least time in memory that way,
-    // and a deleted account cannot be launched with a stale code.
-    let token = match app.store.get_cli(&id) {
-        Ok(tok) => tok.token,
-        Err(e) => {
-            tracing::warn!(id = %id, error = %e, "redeem: no cli token");
-            return (StatusCode::NOT_FOUND, "no session token").into_response();
-        }
-    };
-
-    tracing::info!(id = %id, "session code redeemed");
-    let mut resp = Json(json!({ "token": token })).into_response();
-    // The one token-bearing response in the app: keep it out of every cache.
-    resp.headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    resp
 }
 
 /// Ask the daemon to exit. Any local process holding the bearer file can stop
@@ -569,15 +548,14 @@ async fn remove_account(State(app): State<AppState>, Path(id): Path<String>) -> 
         Ok(()) | Err(CredError::NotFound(_) | CredError::Corrupt(_)) => {}
         Err(e) => tracing::error!(id = %id, error = %e, "delete credential"),
     }
-    // Both grants go, or a forgotten account would leave a live CLI token in
-    // the store with nothing left to name it (SWITCHER §3).
+    // An earlier build kept a second grant beside it; take that too if present.
     match app.store.delete_cli(&id) {
         Ok(()) | Err(CredError::NotFound(_) | CredError::Corrupt(_)) => {}
         Err(e) => tracing::error!(id = %id, error = %e, "delete cli token"),
     }
-    // Any code minted for this account is now unspendable; drop it early
-    // rather than let it sit until its TTL.
-    app.sessions.lock().await.sweep(Instant::now());
+    // The CLI's store is left as it is: whatever is signed in there keeps
+    // working, it just is no longer one of ours.
+    set_active(&app, &id, false).await;
 
     broadcast_state(&app).await;
     if existed {
@@ -593,12 +571,9 @@ async fn events(
     State(app): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let rx = app.events.subscribe();
-    let initial = {
-        let rows = app.rows.read().await;
-        SseMsg {
-            event: "accounts",
-            data: serde_json::to_string(&state::snapshot(&rows)).unwrap_or_else(|_| "[]".into()),
-        }
+    let initial = SseMsg {
+        event: "accounts",
+        data: serde_json::to_string(&snapshot(&app).await).unwrap_or_else(|_| "[]".into()),
     };
     let stream = tokio_stream::once(initial)
         .chain(BroadcastStream::new(rx).filter_map(Result::ok))
@@ -621,10 +596,7 @@ async fn persist_account(app: &AppState, acc: RegAccount) {
 
 /// Serialize the current rows and push them to every `/events` subscriber.
 pub async fn broadcast_state(app: &AppState) {
-    let data = {
-        let rows = app.rows.read().await;
-        serde_json::to_string(&state::snapshot(&rows)).unwrap_or_else(|_| "[]".into())
-    };
+    let data = serde_json::to_string(&snapshot(app).await).unwrap_or_else(|_| "[]".into());
     let _ = app.events.send(SseMsg {
         event: "accounts",
         data,
@@ -713,11 +685,114 @@ async fn sync_row(
     }
 }
 
-/// One account's poll loop: refresh if due → fetch → apply → update → broadcast
-/// → sleep (M1b.5). At most one token refresh per iteration; a rejected refresh
-/// or a post-refresh 401 ends the task — `reconnect needed` rows have no
-/// running task (plan §4). Never holds the rows lock across an await. Exits if
-/// the row is gone (deleted).
+/// What the CLI's store holds, read off the async worker: the credential (or
+/// none) and the uuid beside it. `None` is an unreadable store — logged once
+/// per failure streak — which the caller treats as unknown, never as empty,
+/// so a `security` hiccup cannot move an account off `active` by itself.
+async fn cli_snapshot(
+    app: &AppState,
+    id: &str,
+    poll: &mut PollState,
+) -> Option<(Option<Credential>, Option<String>)> {
+    let cli = app.cli.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        let cred = cli.read()?;
+        let uuid = cli
+            .read_account()
+            .as_ref()
+            .and_then(cuw_switch::account_uuid)
+            .map(str::to_string);
+        Ok::<_, cuw_switch::SwitchError>((cred, uuid))
+    })
+    .await;
+    match read {
+        Ok(Ok(snapshot)) => {
+            poll.cli_read_logged = false;
+            Some(snapshot)
+        }
+        Ok(Err(e)) => {
+            if !poll.cli_read_logged {
+                tracing::warn!(id = %id, error = %e, "cli store unreadable");
+                poll.cli_read_logged = true;
+            }
+            None
+        }
+        Err(_) => {
+            tracing::warn!(id = %id, "cli store read task failed");
+            None
+        }
+    }
+}
+
+/// Put `cred` into the CLI's store, off the async worker. Failure is a log
+/// line: the CLI keeps whatever it had, and the next reconcile sees `Behind`
+/// and tries again.
+async fn write_back(app: &AppState, id: &str, cred: &Credential) {
+    let cli = app.cli.clone();
+    let cred = cred.clone();
+    match tokio::task::spawn_blocking(move || cli.write(&cred)).await {
+        Ok(Ok(())) => tracing::info!(id = %id, "rotated token written to the cli store"),
+        Ok(Err(e)) => tracing::warn!(id = %id, error = %e, "cli store write-back failed"),
+        Err(_) => tracing::warn!(id = %id, "cli store write-back task failed"),
+    }
+}
+
+/// Bring this account and the CLI's store into step before a poll: adopt a
+/// token the CLI refreshed (it may hold the only live refresh token now),
+/// put ours back if the CLI fell behind, and keep `active` truthful. Holds
+/// `cli_lock` from the look to the write, so a switch cannot land in between
+/// and be undone. Returns false when the row is gone.
+async fn reconcile_with_cli(
+    app: &AppState,
+    id: &str,
+    cred: &mut Credential,
+    poll: &mut PollState,
+) -> bool {
+    let my_uuid = {
+        let rows = app.rows.read().await;
+        match rows.get(id) {
+            Some(row) => row.account_uuid().map(str::to_string),
+            None => return false,
+        }
+    };
+    let _guard = app.cli_lock.lock().await;
+    let Some((cli_cred, cli_uuid)) = cli_snapshot(app, id, poll).await else {
+        return true;
+    };
+    let changed = match reconcile(
+        cli_cred.as_ref(),
+        cli_uuid.as_deref(),
+        cred,
+        my_uuid.as_deref(),
+    ) {
+        Reconcile::Active => set_active(app, id, true).await,
+        Reconcile::Foreign => set_active(app, id, false).await,
+        Reconcile::Behind => {
+            write_back(app, id, cred).await;
+            set_active(app, id, true).await
+        }
+        Reconcile::Adopt(next) => {
+            *cred = next;
+            // A token the CLI minted is as good as one we did: the 401-after-
+            // refresh rule applies to it the same way.
+            poll.force_refresh = false;
+            poll.just_refreshed = true;
+            persist(app, id, cred, poll);
+            tracing::info!(id = %id, expires_at = cred.expires_at, "adopted the cli's refreshed token");
+            set_active(app, id, true).await
+        }
+    };
+    if changed {
+        broadcast_state(app).await;
+    }
+    true
+}
+
+/// One account's poll loop: reconcile with the CLI's store → refresh if due →
+/// fetch → apply → update → broadcast → sleep (M1b.5). At most one token
+/// refresh per iteration; a rejected refresh or a post-refresh 401 ends the
+/// task — `reconnect needed` rows have no running task (plan §4). Never holds
+/// the rows lock across an await. Exits if the row is gone (deleted).
 async fn poll_loop(
     app: AppState,
     id: String,
@@ -727,6 +802,9 @@ async fn poll_loop(
     let mut poll = PollState::default();
     tokio::time::sleep(start_delay).await;
     loop {
+        if !reconcile_with_cli(&app, &id, &mut cred, &mut poll).await {
+            return;
+        }
         let now = OffsetDateTime::now_utc();
         if needs_refresh(&cred, &poll, now) {
             tracing::debug!(id = %id, "refreshing access token");
@@ -736,6 +814,16 @@ async fn poll_loop(
                     cred = next;
                     persist(&app, &id, &cred, &mut poll);
                     tracing::info!(id = %id, expires_at = cred.expires_at, "access token refreshed");
+                    // The CLI shares this lineage: hand it the new token now,
+                    // before its own copy expires and it refreshes against a
+                    // refresh token that may no longer be honoured. Checked
+                    // under the lock, so a switch that just landed is not
+                    // written over.
+                    let guard = app.cli_lock.lock().await;
+                    if app.active.read().await.as_deref() == Some(id.as_str()) {
+                        write_back(&app, &id, &cred).await;
+                    }
+                    drop(guard);
                 }
                 RefreshStep::Reconnect => {
                     if sync_row(&app, &id, AccountState::ReconnectNeeded, &cred, &poll).await {
@@ -829,8 +917,6 @@ fn connect_msg(ev: &ConnectEvent) -> SseMsg {
         ConnectEvent::SignInUrl(url) => json!({ "phase": "url", "url": url }),
         ConnectEvent::AwaitingCode => json!({ "phase": "awaiting_code" }),
         ConnectEvent::TokenCaptured => json!({ "phase": "token_captured" }),
-        ConnectEvent::SetupTokenStarted => json!({ "phase": "setup_token" }),
-        ConnectEvent::CliTokenCaptured => json!({ "phase": "cli_token_captured" }),
         ConnectEvent::Validated { id, label } => {
             json!({ "phase": "validated", "id": id, "label": label })
         }

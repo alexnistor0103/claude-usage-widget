@@ -7,6 +7,5 @@ pub mod config;
 pub mod http;
 pub mod poll;
 pub mod registry;
-pub mod session;
 pub mod startup;
 pub mod state;

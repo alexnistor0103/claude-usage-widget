@@ -6,13 +6,13 @@ members = [
     "crates/cuw-connect",
     "crates/cuw-daemon",
     "crates/cuw-tracker",
-    "crates/cuw-launch",
+    "crates/cuw-switch",
 ]
 # apps/overlay/src-tauri is a detached package (its own [workspace]): Tauri is
 # M3, kept out of the backend build so M0–M2 stay quick to check.
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 
@@ -21,7 +21,7 @@ cuw-core = { path = "crates/cuw-core" }
 cuw-creds = { path = "crates/cuw-creds" }
 cuw-connect = { path = "crates/cuw-connect" }
 cuw-tracker = { path = "crates/cuw-tracker" }
-cuw-launch = { path = "crates/cuw-launch" }
+cuw-switch = { path = "crates/cuw-switch" }
 
 anyhow = "1"
 thiserror = "2"

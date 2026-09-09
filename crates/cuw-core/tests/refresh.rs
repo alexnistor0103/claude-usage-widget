@@ -16,13 +16,12 @@ fn golden() -> Value {
 }
 
 fn credential() -> Credential {
-    Credential {
-        v: 1,
-        access_token: FAKE_ACCESS.into(),
-        refresh_token: FAKE_REFRESH.into(),
-        expires_at: 1_756_577_403,
-        scopes: vec!["user:inference".into(), "user:profile".into()],
-    }
+    Credential::new(
+        FAKE_ACCESS,
+        FAKE_REFRESH,
+        1_756_577_403,
+        vec!["user:inference".into(), "user:profile".into()],
+    )
 }
 
 fn refreshed(refresh_token: Option<&str>) -> Refreshed {

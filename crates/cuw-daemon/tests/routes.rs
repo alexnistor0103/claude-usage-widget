@@ -10,16 +10,15 @@ use axum::http::{header::AUTHORIZATION, Request, StatusCode};
 use cuw_core::client::{FetchError, RawResponse, UsageSource};
 use cuw_core::model::{AccountState, Usage, Window};
 use cuw_core::refresh::{RefreshError, Refreshed, TokenRefresher};
-use cuw_core::{CliToken, Credential};
+use cuw_core::Credential;
 use cuw_creds::{CredError, CredentialStore};
 use cuw_daemon::http::{
     after_failed_reconnect, router, seed_delay, spawn_poll_task, AppState, ReconnectFallback,
     SharedSource,
 };
-use cuw_daemon::session::Nonces;
 use cuw_daemon::state::Row;
-use cuw_launch::{LaunchError, LaunchRequest, SessionLauncher};
-use std::sync::atomic::AtomicU16;
+use cuw_switch::{CliStore, SwitchError};
+use serde_json::Value;
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc, Mutex, Notify, RwLock};
 use tower::ServiceExt;
@@ -28,7 +27,9 @@ const BEARER: &str = "test-bearer-token";
 const SECRET_TOKEN: &str = "sk-ant-oat01-FAKEFAKEFAKEFAKEFAKEFAKE0005";
 const SECRET_REFRESH: &str = "sk-ant-ort01-FAKEFAKEFAKEFAKEFAKEFAKE0006";
 const ROTATED_TOKEN: &str = "sk-ant-oat01-FAKEROTATED0000000000000007";
-const SECRET_CLI_TOKEN: &str = "sk-ant-oat01-FAKECLIFAKECLIFAKECLIFAKECLI0009";
+/// What some other login left in the CLI's store.
+const FOREIGN_TOKEN: &str = "sk-ant-oat01-FAKEFOREIGN000000000000000008";
+const FOREIGN_REFRESH: &str = "sk-ant-ort01-FAKEFOREIGN000000000000000009";
 
 /// Scripted usage endpoint: replies pop off the queue; an empty queue answers
 /// the canonical good body. Counts every call.
@@ -104,19 +105,11 @@ impl TokenRefresher for FakeRefresher {
 #[derive(Default)]
 struct MemStore {
     creds: std::sync::Mutex<HashMap<String, Result<Credential, ()>>>,
-    cli: std::sync::Mutex<HashMap<String, CliToken>>,
 }
 
 impl MemStore {
     fn seed_corrupt(&self, id: &str) {
         self.creds.lock().unwrap().insert(id.into(), Err(()));
-    }
-    fn seed_cli(&self, id: &str) {
-        self.put_cli(id, &CliToken::new(SECRET_CLI_TOKEN, now()))
-            .expect("put_cli");
-    }
-    fn has_cli(&self, id: &str) -> bool {
-        self.cli.lock().unwrap().contains_key(id)
     }
 }
 
@@ -139,64 +132,69 @@ impl CredentialStore for MemStore {
         self.creds.lock().unwrap().remove(id);
         Ok(())
     }
-    fn put_cli(&self, id: &str, tok: &CliToken) -> Result<(), CredError> {
-        self.cli.lock().unwrap().insert(id.into(), tok.clone());
-        Ok(())
-    }
-    fn get_cli(&self, id: &str) -> Result<CliToken, CredError> {
-        match self.cli.lock().unwrap().get(id) {
-            Some(tok) => Ok(tok.clone()),
-            None => Err(CredError::NotFound(id.into())),
-        }
-    }
     fn delete_cli(&self, id: &str) -> Result<(), CredError> {
-        self.cli.lock().unwrap().remove(id);
-        Ok(())
+        Err(CredError::NotFound(id.into()))
     }
 }
 
-fn now() -> OffsetDateTime {
-    OffsetDateTime::from_unix_timestamp(1_756_600_000).expect("timestamp")
-}
-
-/// Records what it was asked to launch instead of opening a console. Scripted
-/// to fail so the nonce-burn path is covered too.
+/// The CLI's own store, in memory: what a switch writes and what the poll
+/// loop reconciles against. Scripted to fail so the refusal path is covered.
 #[derive(Default)]
-struct FakeLauncher {
-    calls: std::sync::Mutex<Vec<LaunchRequest>>,
+struct FakeCli {
+    cred: std::sync::Mutex<Option<Credential>>,
+    account: std::sync::Mutex<Option<Value>>,
+    writes: AtomicUsize,
     fail: std::sync::atomic::AtomicBool,
 }
 
-impl FakeLauncher {
-    fn last(&self) -> Option<LaunchRequest> {
-        self.calls.lock().unwrap().last().cloned()
+impl FakeCli {
+    fn seed(&self, cred: Credential, account: Option<Value>) {
+        *self.cred.lock().unwrap() = Some(cred);
+        *self.account.lock().unwrap() = account;
     }
-    fn count(&self) -> usize {
-        self.calls.lock().unwrap().len()
+    fn held(&self) -> Option<Credential> {
+        self.cred.lock().unwrap().clone()
+    }
+    fn held_account(&self) -> Option<Value> {
+        self.account.lock().unwrap().clone()
     }
     fn script_failure(&self) {
         self.fail.store(true, Ordering::SeqCst);
     }
 }
 
-impl SessionLauncher for FakeLauncher {
-    fn launch(&self, req: LaunchRequest) -> Result<(), LaunchError> {
-        self.calls.lock().unwrap().push(req);
+impl CliStore for FakeCli {
+    fn read(&self) -> Result<Option<Credential>, SwitchError> {
+        Ok(self.cred.lock().unwrap().clone())
+    }
+    fn write(&self, cred: &Credential) -> Result<(), SwitchError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
         if self.fail.load(Ordering::SeqCst) {
-            return Err(LaunchError::Spawn("no terminal in tests".into()));
+            return Err(SwitchError::Write("no keychain in tests".into()));
         }
+        *self.cred.lock().unwrap() = Some(cred.clone());
+        Ok(())
+    }
+    fn read_account(&self) -> Option<Value> {
+        self.account.lock().unwrap().clone()
+    }
+    fn write_account(&self, account: Option<&Value>) -> Result<(), SwitchError> {
+        *self.account.lock().unwrap() = account.cloned();
         Ok(())
     }
 }
 
+fn identity(uuid: &str, email: &str) -> Value {
+    serde_json::json!({ "accountUuid": uuid, "emailAddress": email, "seatTier": null })
+}
+
 fn fake_credential() -> Credential {
-    Credential {
-        v: 1,
-        access_token: SECRET_TOKEN.into(),
-        refresh_token: SECRET_REFRESH.into(),
-        expires_at: 1_756_600_000,
-        scopes: vec!["user:inference".into(), "user:profile".into()],
-    }
+    Credential::new(
+        SECRET_TOKEN,
+        SECRET_REFRESH,
+        1_756_600_000,
+        vec!["user:inference".into(), "user:profile".into()],
+    )
 }
 
 fn available(five: f32, seven: f32) -> AccountState {
@@ -219,14 +217,14 @@ struct Harness {
     source: Arc<FakeSource>,
     refresher: Arc<FakeRefresher>,
     store: Arc<MemStore>,
-    launcher: Arc<FakeLauncher>,
+    cli: Arc<FakeCli>,
 }
 
 fn harness_with_rows(rows: HashMap<String, Row>) -> Harness {
     let source = Arc::new(FakeSource::default());
     let refresher = Arc::new(FakeRefresher::default());
     let store = Arc::new(MemStore::default());
-    let launcher = Arc::new(FakeLauncher::default());
+    let cli = Arc::new(FakeCli::default());
 
     let (events, _) = broadcast::channel(16);
     let tmp = std::env::temp_dir().join(format!("cuw-test-registry-{}.toml", std::process::id()));
@@ -246,18 +244,16 @@ fn harness_with_rows(rows: HashMap<String, Row>) -> Harness {
         refresher: refresher.clone(),
         shutdown: Arc::new(Notify::new()),
         connect_task: Arc::new(Mutex::new(None)),
-        sessions: Arc::new(Mutex::new(Nonces::default())),
-        launcher: launcher.clone(),
-        port: Arc::new(AtomicU16::new(8787)),
-        // Every launch validates it, so it has to be a directory that exists.
-        default_cwd: Arc::new(std::env::temp_dir()),
+        cli: cli.clone(),
+        active: Arc::new(RwLock::new(None)),
+        cli_lock: Arc::new(Mutex::new(())),
     };
     Harness {
         app,
         source,
         refresher,
         store,
-        launcher,
+        cli,
     }
 }
 
@@ -655,226 +651,196 @@ fn mem_store_corrupt_seed_reads_as_corrupt() {
 }
 
 // ---------------------------------------------------------------------------
-// Session switching (SWITCHER §4). `POST /accounts/:id/session` mints a code and
-// launches; `GET /session/:nonce` is the one route that returns a token.
+// Account switching. `POST /accounts/:id/switch` writes the credential into the
+// CLI's store; the poll loop keeps the two stores in step afterwards.
 // ---------------------------------------------------------------------------
 
-fn get(uri: &str, bearer: Option<&str>) -> Request<Body> {
-    let mut b = Request::builder().uri(uri);
-    if let Some(t) = bearer {
-        b = b.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    b.body(Body::empty()).unwrap()
-}
-
-async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+async fn body_json(resp: axum::response::Response) -> Value {
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
 }
 
-/// Mint a code the way the route does, without going through the launcher.
-async fn mint(h: &Harness, id: &str) -> String {
-    h.app
-        .sessions
-        .lock()
+async fn accounts_json(app: &AppState) -> Value {
+    let resp = router(app.clone())
+        .oneshot(get_accounts(Some(BEARER)))
         .await
-        .mint(id, std::time::Instant::now())
+        .unwrap();
+    body_json(resp).await
+}
+
+fn by_id<'a>(v: &'a Value, id: &str) -> &'a Value {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == id)
+        .unwrap_or_else(|| panic!("no row {id}"))
+}
+
+/// The seeded credential with an expiry the real clock will not cross: the
+/// poll loop refreshes against `now_utc()`, which paused tokio time does not
+/// move.
+fn live_credential() -> Credential {
+    let mut c = fake_credential();
+    c.expires_at = 9_999_999_999;
+    c
+}
+
+fn row(state: AccountState, at: i64) -> Row {
+    Row::new(
+        "Work".into(),
+        state,
+        OffsetDateTime::from_unix_timestamp(at).unwrap(),
+    )
+}
+
+/// One account with a credential in the store and an identity on its row.
+fn switch_harness() -> Harness {
+    let mut rows = HashMap::new();
+    let mut work = row(available(31.0, 14.0), 1_700_000_000);
+    work.account = Some(identity("u-work", "work@example.com"));
+    rows.insert("work-abc12345".to_string(), work);
+    rows.insert(
+        "home-def67890".to_string(),
+        row(AccountState::ReconnectNeeded, 1_700_000_100),
+    );
+    let h = harness_with_rows(rows);
+    h.store.put("work-abc12345", &fake_credential()).unwrap();
+    h
 }
 
 #[tokio::test]
-async fn a_session_launch_mints_a_code_and_never_returns_a_token() {
-    let h = harness();
-    h.store.seed_cli("work-abc12345");
+async fn a_switch_writes_the_credential_and_identity_and_marks_the_row_active() {
+    let h = switch_harness();
+    h.cli.seed(
+        Credential::new(FOREIGN_TOKEN, FOREIGN_REFRESH, 1_756_600_000, vec![]),
+        Some(identity("u-other", "other@example.com")),
+    );
 
     let resp = router(h.app.clone())
-        .oneshot(post(
-            "/accounts/work-abc12345/session",
-            Some(BEARER),
-            Some(serde_json::json!({})),
-        ))
+        .oneshot(post("/accounts/work-abc12345/switch", Some(BEARER), None))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let text = String::from_utf8_lossy(&bytes);
-    assert!(
-        !text.contains("sk-ant"),
-        "a token reached the overlay: {text}"
-    );
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["ok"], true);
+    assert!(!text.contains("sk-ant"), "a token reached the wire: {text}");
+    assert_eq!(text, r#"{"ok":true}"#);
 
-    // The launcher was handed the bound port and a nonce, never a token.
-    let req = h.launcher.last().expect("launched");
-    assert_eq!(req.port, 8787);
-    assert_eq!(req.cwd, std::env::temp_dir());
-    assert!(req.nonce.chars().all(|c| c.is_ascii_hexdigit()));
-    assert!(req.terminal.is_none());
+    let held = h.cli.held().expect("the cli store was written");
+    assert_eq!(held.access_token, SECRET_TOKEN);
+    assert_eq!(held.refresh_token, SECRET_REFRESH);
+    assert_eq!(
+        h.cli.held_account().unwrap()["emailAddress"],
+        "work@example.com"
+    );
+
+    let v = accounts_json(&h.app).await;
+    assert_eq!(by_id(&v, "work-abc12345")["active"], true);
+    assert_eq!(by_id(&v, "work-abc12345")["email"], "work@example.com");
+    assert_eq!(by_id(&v, "home-def67890")["active"], false);
+    assert!(by_id(&v, "home-def67890").get("email").is_none());
+    assert!(!v.to_string().contains("sk-ant"));
 }
 
+/// An account connected before identities were captured: the switch still
+/// signs the CLI in, and the previous identity block is removed rather than
+/// left naming an account the CLI no longer holds.
 #[tokio::test]
-async fn a_session_launch_forwards_the_terminal_override_and_cwd() {
-    let h = harness();
-    h.store.seed_cli("work-abc12345");
-    let cwd = std::env::temp_dir();
-
+async fn a_switch_without_an_identity_clears_the_previous_block() {
+    let h = switch_harness();
+    h.app
+        .rows
+        .write()
+        .await
+        .get_mut("work-abc12345")
+        .unwrap()
+        .account = None;
+    h.cli.seed(
+        Credential::new(FOREIGN_TOKEN, FOREIGN_REFRESH, 1_756_600_000, vec![]),
+        Some(identity("u-other", "other@example.com")),
+    );
     let resp = router(h.app.clone())
-        .oneshot(post(
-            "/accounts/work-abc12345/session",
-            Some(BEARER),
-            Some(serde_json::json!({
-                "cwd": cwd.to_string_lossy(),
-                "terminal": ["wt.exe", "-w", "0", "nt"],
-            })),
-        ))
+        .oneshot(post("/accounts/work-abc12345/switch", Some(BEARER), None))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-
-    let req = h.launcher.last().expect("launched");
-    assert_eq!(req.cwd, cwd);
-    assert_eq!(
-        req.terminal.as_deref(),
-        Some(["wt.exe", "-w", "0", "nt"].map(String::from).as_slice())
-    );
+    assert_eq!(h.cli.held().unwrap().access_token, SECRET_TOKEN);
+    assert!(h.cli.held_account().is_none(), "a stale identity survived");
 }
 
 #[tokio::test]
-async fn an_account_with_no_cli_token_cannot_switch() {
-    let h = harness();
+async fn a_row_that_needs_a_reconnect_cannot_be_switched_to() {
+    let h = switch_harness();
+    // A dead token whose blob is still stored: the usual post-401 shape.
+    h.store.put("home-def67890", &fake_credential()).unwrap();
     let resp = router(h.app.clone())
-        .oneshot(post(
-            "/accounts/work-abc12345/session",
-            Some(BEARER),
-            Some(serde_json::json!({})),
-        ))
+        .oneshot(post("/accounts/home-def67890/switch", Some(BEARER), None))
         .await
         .unwrap();
-    // A display state, not a server error: the row says `switch unavailable`.
     assert_eq!(resp.status(), StatusCode::CONFLICT);
-    assert_eq!(h.launcher.count(), 0, "nothing was launched");
-    assert_eq!(
-        h.app
-            .sessions
-            .lock()
-            .await
-            .mint("x", std::time::Instant::now())
-            .len(),
-        64,
-        "the store is still usable"
-    );
+    assert_eq!(h.cli.writes.load(Ordering::SeqCst), 0);
+    assert!(h.app.active.read().await.is_none());
 }
 
 #[tokio::test]
-async fn a_session_for_an_unknown_account_is_404() {
-    let h = harness();
+async fn a_switch_for_an_unknown_account_is_404() {
+    let h = switch_harness();
     let resp = router(h.app.clone())
-        .oneshot(post("/accounts/nope-00000000/session", Some(BEARER), None))
+        .oneshot(post("/accounts/nope-00000000/switch", Some(BEARER), None))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    assert_eq!(h.launcher.count(), 0);
+    assert_eq!(h.cli.writes.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
-async fn a_failed_launch_burns_the_code() {
-    let h = harness();
-    h.store.seed_cli("work-abc12345");
-    h.launcher.script_failure();
-
+async fn an_account_without_a_stored_credential_cannot_switch() {
+    let h = switch_harness();
     let resp = router(h.app.clone())
-        .oneshot(post("/accounts/work-abc12345/session", Some(BEARER), None))
+        .oneshot(post("/accounts/home-def67890/switch", Some(BEARER), None))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-
-    // The code the launcher was given is no longer redeemable.
-    let nonce = h.launcher.last().expect("attempted").nonce;
-    let refused = router(h.app.clone())
-        .oneshot(get(&format!("/session/{nonce}"), Some(BEARER)))
-        .await
-        .unwrap();
-    assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(h.cli.writes.load(Ordering::SeqCst), 0);
+    assert!(h.app.active.read().await.is_none());
 }
 
 #[tokio::test]
-async fn redeeming_returns_the_cli_token_once_and_never_the_login_credential() {
-    let h = harness();
-    h.store.seed_cli("work-abc12345");
-    let nonce = mint(&h, "work-abc12345").await;
-
+async fn a_switch_needs_the_bearer() {
+    let h = switch_harness();
     let resp = router(h.app.clone())
-        .oneshot(get(&format!("/session/{nonce}"), Some(BEARER)))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers()
-            .get("cache-control")
-            .map(|v| v.to_str().unwrap()),
-        Some("no-store"),
-        "the one token-bearing response must not be cached"
-    );
-
-    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["token"], SECRET_CLI_TOKEN);
-    // The `user:profile` credential has a different key and no route (plan §5).
-    assert!(
-        !text.contains(SECRET_TOKEN),
-        "the login access token leaked"
-    );
-    assert!(!text.contains(SECRET_REFRESH), "the refresh token leaked");
-
-    // Single-use: the second read gets nothing.
-    let again = router(h.app.clone())
-        .oneshot(get(&format!("/session/{nonce}"), Some(BEARER)))
-        .await
-        .unwrap();
-    assert_eq!(again.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn redeeming_requires_the_bearer() {
-    let h = harness();
-    h.store.seed_cli("work-abc12345");
-    let nonce = mint(&h, "work-abc12345").await;
-
-    let resp = router(h.app.clone())
-        .oneshot(get(&format!("/session/{nonce}"), None))
+        .oneshot(post("/accounts/work-abc12345/switch", None, None))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    // Refused before the nonce was touched: the code is still good.
-    let ok = router(h.app.clone())
-        .oneshot(get(&format!("/session/{nonce}"), Some(BEARER)))
-        .await
-        .unwrap();
-    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(h.cli.writes.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
-async fn a_code_whose_token_vanished_is_refused() {
-    let h = harness();
-    h.store.seed_cli("work-abc12345");
-    let nonce = mint(&h, "work-abc12345").await;
-    h.store.delete_cli("work-abc12345").expect("delete_cli");
-
+async fn a_failed_store_write_is_reported_and_marks_nothing_active() {
+    let h = switch_harness();
+    h.cli.script_failure();
     let resp = router(h.app.clone())
-        .oneshot(get(&format!("/session/{nonce}"), Some(BEARER)))
+        .oneshot(post("/accounts/work-abc12345/switch", Some(BEARER), None))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    assert!(body_json(resp).await.get("token").is_none());
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("no keychain in tests"), "{text}");
+    assert!(!text.contains("sk-ant"), "{text}");
+    assert!(h.app.active.read().await.is_none());
+    assert!(h.cli.held().is_none());
 }
 
 #[tokio::test]
-async fn deleting_an_account_drops_both_grants() {
-    let h = harness();
-    h.store.seed_cli("work-abc12345");
+async fn deleting_the_active_account_clears_active_but_leaves_the_cli_store() {
+    let h = switch_harness();
+    router(h.app.clone())
+        .oneshot(post("/accounts/work-abc12345/switch", Some(BEARER), None))
+        .await
+        .unwrap();
+    assert_eq!(h.app.active.read().await.as_deref(), Some("work-abc12345"));
 
     let resp = router(h.app.clone())
         .oneshot(
@@ -889,28 +855,140 @@ async fn deleting_an_account_drops_both_grants() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert!(h.store.get("work-abc12345").is_err());
-    assert!(
-        !h.store.has_cli("work-abc12345"),
-        "the CLI token outlived its account"
+    assert!(h.app.active.read().await.is_none());
+    assert_eq!(
+        h.cli.held().map(|c| c.access_token),
+        Some(SECRET_TOKEN.to_string()),
+        "the cli keeps its login"
     );
 }
 
-#[tokio::test]
-async fn a_row_with_a_cli_token_advertises_the_switch() {
-    let mut rows = HashMap::new();
-    let mut row = Row::new(
-        "Work".into(),
-        available(31.0, 14.0),
-        OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
-    );
-    row.can_switch = true;
-    rows.insert("work-abc12345".to_string(), row);
+/// The poll loop sees the CLI holding the same lineage and marks the row
+/// active without anyone having pressed the button.
+#[tokio::test(start_paused = true)]
+async fn the_poll_loop_notices_the_cli_already_holds_this_account() {
+    let h = switch_harness();
+    h.cli.seed(live_credential(), None);
+    spawn_poll_task(
+        &h.app,
+        "work-abc12345".into(),
+        live_credential(),
+        std::time::Duration::ZERO,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    assert_eq!(h.app.active.read().await.as_deref(), Some("work-abc12345"));
+    assert_eq!(h.cli.writes.load(Ordering::SeqCst), 0, "nothing to write");
+    assert_eq!(h.refresher.calls.load(Ordering::SeqCst), 0);
+}
 
-    let h = harness_with_rows(rows);
-    let resp = router(h.app)
-        .oneshot(get_accounts(Some(BEARER)))
-        .await
-        .unwrap();
-    let v = body_json(resp).await;
-    assert_eq!(v[0]["can_switch"], true);
+/// The CLI refreshed first (a rotation that changed both tokens, tied to us
+/// only by uuid): its copy is adopted, persisted, and used for the fetch — no
+/// refresh of our own, which could be refused now.
+#[tokio::test(start_paused = true)]
+async fn the_poll_loop_adopts_a_token_the_cli_refreshed() {
+    let h = switch_harness();
+    let mut theirs = Credential::new(FOREIGN_TOKEN, FOREIGN_REFRESH, 9_999_999_999, vec![]);
+    theirs.subscription_type = Some("max".into());
+    h.cli
+        .seed(theirs, Some(identity("u-work", "work@example.com")));
+
+    let mut ours = fake_credential();
+    ours.expires_at = 0; // would refresh, if it were not superseded
+    spawn_poll_task(
+        &h.app,
+        "work-abc12345".into(),
+        ours,
+        std::time::Duration::ZERO,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    assert_eq!(h.refresher.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(h.source.calls.load(Ordering::SeqCst), 1);
+    let stored = h.store.get("work-abc12345").unwrap();
+    assert_eq!(stored.access_token, FOREIGN_TOKEN);
+    assert_eq!(stored.refresh_token, FOREIGN_REFRESH);
+    assert_eq!(stored.subscription_type.as_deref(), Some("max"));
+    assert_eq!(h.app.active.read().await.as_deref(), Some("work-abc12345"));
+}
+
+/// The daemon refreshes while active: the rotated token goes straight back
+/// into the CLI's store, so the CLI never refreshes against a stale token.
+#[tokio::test(start_paused = true)]
+async fn a_rotation_while_active_is_written_back_to_the_cli() {
+    let h = switch_harness();
+    h.cli.seed(fake_credential(), None);
+    let mut ours = fake_credential();
+    ours.expires_at = 0;
+    spawn_poll_task(
+        &h.app,
+        "work-abc12345".into(),
+        ours,
+        std::time::Duration::ZERO,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    assert_eq!(h.refresher.calls.load(Ordering::SeqCst), 1);
+    let held = h.cli.held().unwrap();
+    assert_eq!(held.access_token, ROTATED_TOKEN);
+    assert_eq!(held.refresh_token, SECRET_REFRESH);
+    assert_eq!(
+        h.store.get("work-abc12345").unwrap().access_token,
+        ROTATED_TOKEN
+    );
+}
+
+/// Someone ran `/login` as an account we do not know: the row stops being
+/// active, its own credential is untouched, and the CLI's login is left alone.
+#[tokio::test(start_paused = true)]
+async fn a_foreign_login_clears_active_and_is_not_adopted() {
+    let h = switch_harness();
+    *h.app.active.write().await = Some("work-abc12345".into());
+    h.cli.seed(
+        Credential::new(FOREIGN_TOKEN, FOREIGN_REFRESH, 1_756_600_000, vec![]),
+        Some(identity("u-other", "other@example.com")),
+    );
+    spawn_poll_task(
+        &h.app,
+        "work-abc12345".into(),
+        live_credential(),
+        std::time::Duration::ZERO,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    assert!(h.app.active.read().await.is_none());
+    assert_eq!(
+        h.store.get("work-abc12345").unwrap().access_token,
+        SECRET_TOKEN
+    );
+    assert_eq!(h.cli.held().unwrap().access_token, FOREIGN_TOKEN);
+    assert_eq!(h.cli.writes.load(Ordering::SeqCst), 0);
+}
+
+/// The CLI holds an older token of ours (a write-back that never landed):
+/// the current one goes back in.
+#[tokio::test(start_paused = true)]
+async fn a_cli_that_fell_behind_gets_the_current_token() {
+    let h = switch_harness();
+    let mut old = fake_credential();
+    old.expires_at = 1_000;
+    h.cli.seed(old, None);
+    let mut ours = fake_credential();
+    ours.access_token = ROTATED_TOKEN.into();
+    ours.expires_at = 9_999_999_999;
+    spawn_poll_task(
+        &h.app,
+        "work-abc12345".into(),
+        ours,
+        std::time::Duration::ZERO,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    assert_eq!(h.cli.held().unwrap().access_token, ROTATED_TOKEN);
+    assert_eq!(h.app.active.read().await.as_deref(), Some("work-abc12345"));
+    assert_eq!(h.refresher.calls.load(Ordering::SeqCst), 0);
 }

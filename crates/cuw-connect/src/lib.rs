@@ -17,12 +17,11 @@
 //! queries** and **forward a pasted code in** — a read-only PTY hangs before the
 //! browser ever opens.
 //!
-//! While that scratch dir is still signed in, a second invocation —
-//! `claude setup-token` — mints the independent, long-lived grant the session
-//! switcher hands to a new terminal (SWITCHER §3). It is a second *interactive*
-//! step with its own browser consent screen, driven by the same PTY code, and
-//! its token is read out of the terminal rather than a file. Failing to capture
-//! one is a display state, not a connect failure (SWITCHER §6).
+//! The scratch dir's `.claude.json` also ends up holding the `oauthAccount`
+//! block the CLI writes after a login — who the account is, by uuid and email.
+//! It is read alongside the credential so a later switch can put the same
+//! identity into the real config; missing it is a degraded state, never a
+//! failure.
 
 use std::ffi::OsStr;
 use std::io::{Read, Write};
@@ -32,10 +31,9 @@ use std::time::Duration;
 
 use cuw_core::client::{FetchError, UsageSource};
 use cuw_core::redact;
-use cuw_core::{CliToken, Credential};
+use cuw_core::Credential;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde_json::Value;
-use time::OffsetDateTime;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::MissedTickBehavior;
 
@@ -47,17 +45,13 @@ type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 /// a code — but bounded so an abandoned flow can't wedge the connect slot.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Cap on the `setup-token` step. Shorter, because the two caps run back to back
-/// on the one connect slot and by this point the user is already at the browser.
-const SETUP_TOKEN_TIMEOUT: Duration = Duration::from_secs(180);
-
 /// PTY width for the login TUI.
 const LOGIN_COLS: u16 = 120;
 
-/// Wider for `setup-token`: its token is ~110 characters and is parsed out of
-/// the terminal, so the line must not wrap (a wrapped run would be captured
-/// truncated and bind nothing).
-const TOKEN_COLS: u16 = 240;
+/// After the credential lands, how long the CLI is left running for it to
+/// fetch the profile and write `oauthAccount` into the scratch config. It does
+/// that right after saving the tokens, so this rarely waits out.
+const ACCOUNT_GRACE: Duration = Duration::from_secs(5);
 
 /// How often the scratch dir is checked for the credential file.
 const CRED_POLL: Duration = Duration::from_millis(250);
@@ -109,11 +103,6 @@ pub enum ConnectEvent {
     AwaitingCode,
     /// The credential file has been read from the scratch dir.
     TokenCaptured,
-    /// The `setup-token` step is starting. It opens a **second** browser consent
-    /// screen (SWITCHER §3), so the UI has to announce it or it reads as a bug.
-    SetupTokenStarted,
-    /// The CLI token has been read out of `setup-token`'s output.
-    CliTokenCaptured,
     Validated {
         id: String,
         label: String,
@@ -159,33 +148,28 @@ pub struct ConnectRequest {
     pub scratch_root: PathBuf,
 }
 
-/// A validated account. `credential` and `cli_token` are the only places a
-/// secret travels; the caller (the daemon) stores both in the OS store and
-/// never echoes them (plan §5). Both types redact in `Debug`, so deriving here
-/// is safe.
+/// A validated account. `credential` is the only place a secret travels; the
+/// caller (the daemon) stores it in the OS store and never echoes it (plan
+/// §5). `Credential` redacts in `Debug`, so deriving here is safe.
 #[derive(Debug, Clone)]
 pub struct Connected {
     pub id: String,
     pub label: String,
     pub credential: Credential,
-    /// The CLI's own grant, when `setup-token` produced one. `None` means the
-    /// row shows `switch unavailable` — a display state, not a failure
-    /// (SWITCHER §6).
-    pub cli_token: Option<CliToken>,
+    /// The CLI's `oauthAccount` block for this login, when the CLI wrote one
+    /// in time: uuid, email, org. No secret in it. `None` means a switch to
+    /// this account cannot update what `/status` shows, and the daemon cannot
+    /// tell a token the CLI rotated from another account's.
+    pub account: Option<Value>,
 }
 
-/// Run the connect flow to completion. Two interactive steps under one scratch
-/// `CLAUDE_CONFIG_DIR` the daemon owns:
+/// Run the connect flow to completion: `claude auth login --claudeai` under a
+/// scratch `CLAUDE_CONFIG_DIR` the daemon owns. Its output is streamed (cleaned
+/// and redacted) via `emit`, any code arriving on `code_rx` is forwarded into
+/// the PTY, and the credential the CLI writes is read back, scope-gated and
+/// validated once via `source.fetch`.
 ///
-/// 1. `claude auth login --claudeai` — the widget's own credential. Its output
-///    is streamed (cleaned and redacted) via `emit`, any code arriving on
-///    `code_rx` is forwarded into the PTY, and the credential file the CLI
-///    writes is read back, scope-gated and validated once via `source.fetch`.
-/// 2. `claude setup-token` — the independent CLI grant, minted while the dir is
-///    still signed in (SWITCHER §3). Its own browser consent screen, and its own
-///    announced phase. If it yields nothing the connect still succeeds.
-///
-/// On success returns [`Connected`]; the secrets appear only there, never in an
+/// On success returns [`Connected`]; the secret appears only there, never in an
 /// emitted event.
 ///
 /// `label` is user-supplied: the usage payload carries no email/org (S1 Q4),
@@ -215,11 +199,11 @@ where
     let mut scratch = ScratchGuard::create(&scratch_root).map_err(|e| fail(&emit, e))?;
     let config_dir = scratch.path().to_path_buf();
 
-    // One scrub for every outcome: the dir has to outlive both CLI runs and the
+    // One scrub for every outcome: the dir has to outlive the CLI run and the
     // validating fetch, and it dies exactly once, on whichever path we leave by.
     let outcome = signed_in(source, &config_dir, &emit, &mut code_rx).await;
     scratch.scrub_async().await;
-    let (credential, cli_token) = outcome?;
+    let (credential, account) = outcome?;
 
     emit(ConnectEvent::Validated {
         id: id.clone(),
@@ -229,125 +213,62 @@ where
         id,
         label,
         credential,
-        cli_token,
+        account,
     })
 }
 
-/// Everything that needs the scratch dir signed in: the login, the scope gate
-/// and validating fetch, then the `setup-token` capture. Split out of
-/// [`connect`] so the scrub sits on one path. Errors are already announced
-/// through `emit` by the time they are returned.
+/// Everything that needs the scratch dir signed in: the login, then the scope
+/// gate and validating fetch. Split out of [`connect`] so the scrub sits on one
+/// path. Errors are already announced through `emit` by the time they are
+/// returned.
 async fn signed_in<S, F>(
     source: &S,
     config_dir: &Path,
     emit: &F,
     code_rx: &mut UnboundedReceiver<String>,
-) -> Result<(Credential, Option<CliToken>), ConnectError>
+) -> Result<(Credential, Option<Value>), ConnectError>
 where
     S: UsageSource,
     F: Fn(ConnectEvent),
 {
-    let run = run_cli(
-        &["auth", "login", "--claudeai"],
-        config_dir,
-        LOGIN_COLS,
-        Watch::CredentialFile,
-        CONNECT_TIMEOUT,
-        emit,
-        code_rx,
-    )
-    .await?;
+    let run = run_cli(&["auth", "login", "--claudeai"], config_dir, emit, code_rx).await?;
 
     let cred = match run.credential {
         Some(c) => c,
         None if run.timed_out => return Err(fail(emit, ConnectError::TimedOut)),
         None => return Err(fail(emit, ConnectError::NoCredential)),
     };
-
-    // Ahead of the second browser step, so a login that can never pass the usage
-    // endpoint does not first cost the user a consent screen.
     validate(source, &cred, emit).await?;
 
-    let cli_token = capture_cli_token(config_dir, emit, code_rx).await;
-    Ok((cred, cli_token))
-}
-
-/// The second grant: `setup-token` in the still-signed-in scratch dir. Announced
-/// first, because it opens its **own** browser consent screen (SWITCHER §3).
-///
-/// Nothing here can fail the connect. An account with no CLI token shows
-/// `switch unavailable` with a reconnect action (SWITCHER §6), so every failure
-/// becomes a line in the connect log and a `None`.
-async fn capture_cli_token<F>(
-    config_dir: &Path,
-    emit: &F,
-    code_rx: &mut UnboundedReceiver<String>,
-) -> Option<CliToken>
-where
-    F: Fn(ConnectEvent),
-{
-    emit(ConnectEvent::SetupTokenStarted);
-    let token = match run_cli(
-        &["setup-token"],
-        config_dir,
-        TOKEN_COLS,
-        Watch::TokenLine,
-        SETUP_TOKEN_TIMEOUT,
-        emit,
-        code_rx,
-    )
-    .await
-    {
-        Ok(run) => run.cli_token,
-        // `run_cli` already emitted the failure; keep the account.
-        Err(_) => None,
-    };
-
-    match token {
-        Some(t) => Some(CliToken::new(t, OffsetDateTime::now_utc())),
-        None => {
-            emit(ConnectEvent::Output(
-                "No session token captured - the account is connected, but will show \
-                 `switch unavailable`. Reconnect it to try again."
-                    .into(),
-            ));
-            None
-        }
+    if run.account.is_none() {
+        emit(ConnectEvent::Output(
+            "The CLI did not record who this account is in time; switching to it \
+             will still work, but `/status` may keep showing the previous identity."
+                .into(),
+        ));
     }
+    Ok((cred, run.account))
 }
 
-/// What ends a [`run_cli`] before the CLI exits on its own.
-enum Watch {
-    /// `auth login` writes `.credentials.json` and then lingers on a success
-    /// screen, so the file — not the exit — is the signal.
-    CredentialFile,
-    /// `setup-token` prints its token and waits, and writes nothing, so the
-    /// signal is the token appearing in the output.
-    TokenLine,
-}
-
-/// What one [`run_cli`] came back with. Exactly one of the two captures is ever
-/// populated, decided by the [`Watch`].
+/// What one [`run_cli`] came back with.
 #[derive(Default)]
 struct Run {
     credential: Option<Credential>,
-    cli_token: Option<String>,
+    /// The `oauthAccount` block, when the CLI wrote it before teardown.
+    account: Option<Value>,
     timed_out: bool,
 }
 
 /// One `claude` invocation in a PTY under `config_dir`. Answers the TUI's
 /// terminal-capability queries so it can proceed, streams cleaned and redacted
 /// output through `emit`, forwards pasted codes from `code_rx`, and returns once
-/// `watch` is satisfied, the CLI exits, or `timeout` passes.
-///
-/// `code_rx` is borrowed rather than consumed: both interactive steps of one
-/// connect are fed by the same channel, which is the modal's only way in.
+/// the credential (and, within a grace period, the account block) has landed,
+/// the CLI exits, or [`CONNECT_TIMEOUT`] passes. `auth login` writes the
+/// credential and then lingers on a success screen, so the file — not the exit
+/// — is the signal.
 async fn run_cli<F>(
     args: &[&str],
     config_dir: &Path,
-    cols: u16,
-    watch: Watch,
-    timeout: Duration,
     emit: &F,
     code_rx: &mut UnboundedReceiver<String>,
 ) -> Result<Run, ConnectError>
@@ -358,7 +279,7 @@ where
     let pair = pty
         .openpty(PtySize {
             rows: 30,
-            cols,
+            cols: LOGIN_COLS,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -426,7 +347,7 @@ where
     let mut child = child;
     let mut child_exit = tokio::task::spawn_blocking(move || child.wait());
 
-    let cred_path = config_dir.join(".credentials.json");
+    let paths = ScratchPaths::new(config_dir);
     let mut tick = tokio::time::interval(CRED_POLL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut scan = OutputScan::default();
@@ -435,14 +356,17 @@ where
     // Once the modal is gone the channel closes; without this the arm would
     // keep matching `None` and spin the loop.
     let mut code_open = true;
-    let deadline = tokio::time::sleep(timeout);
+    // Set once the credential is in hand: the CLI gets [`ACCOUNT_GRACE`] more
+    // to write the account block before it is torn down.
+    let mut grace: Option<tokio::time::Instant> = None;
+    let deadline = tokio::time::sleep(CONNECT_TIMEOUT);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
             maybe = orx.recv() => match maybe {
                 Some(raw) => {
                     scan.feed(&raw, emit);
-                    if capture(&watch, &cred_path, &scan, &mut run, emit) {
+                    if capture(&paths, &scan, &mut run, emit, &mut grace) {
                         break;
                     }
                 }
@@ -451,7 +375,7 @@ where
                 // reader this arm wins the race with the tick, so anything the
                 // CLI already produced must not be dropped here.
                 None => {
-                    capture_retrying(&watch, &cred_path, &scan, &mut run, emit).await;
+                    capture_retrying(&paths, &scan, &mut run, emit).await;
                     break;
                 }
             },
@@ -469,7 +393,7 @@ where
                 None => code_open = false,
             },
             _ = tick.tick() => {
-                if capture(&watch, &cred_path, &scan, &mut run, emit) {
+                if capture(&paths, &scan, &mut run, emit, &mut grace) {
                     break;
                 }
             }
@@ -482,7 +406,7 @@ where
                 while let Ok(Some(raw)) = tokio::time::timeout_at(until, orx.recv()).await {
                     scan.feed(&raw, emit);
                 }
-                capture_retrying(&watch, &cred_path, &scan, &mut run, emit).await;
+                capture_retrying(&paths, &scan, &mut run, emit).await;
                 break;
             }
             _ = &mut deadline => {
@@ -505,60 +429,72 @@ where
     Ok(run)
 }
 
-/// Poll the watch once. `true` when the run has what it came for, in which case
-/// the matching capture is now in `run`.
-fn capture<F: Fn(ConnectEvent)>(
-    watch: &Watch,
-    cred_path: &Path,
-    scan: &OutputScan,
-    run: &mut Run,
-    emit: &F,
-) -> bool {
-    match watch {
-        Watch::CredentialFile => {
-            let found = read_credentials(cred_path);
-            // On macOS the CLI stores the credential in the login Keychain by
-            // default and writes no file; once the login has announced success,
-            // the scratch dir's own Keychain item is the place to look.
-            #[cfg(target_os = "macos")]
-            let found = found.or_else(|| {
-                let dir = cred_path.parent().unwrap_or(cred_path);
-                scan.login_seen
-                    .then(|| read_keychain_credentials(dir))
-                    .flatten()
-            });
-            match found {
-                Some(c) => {
-                    run.credential = Some(c);
-                    emit(ConnectEvent::TokenCaptured);
-                    true
-                }
-                None => false,
-            }
+/// The two files a login leaves in the scratch dir.
+struct ScratchPaths {
+    credentials: PathBuf,
+    config: PathBuf,
+}
+
+impl ScratchPaths {
+    fn new(config_dir: &Path) -> ScratchPaths {
+        ScratchPaths {
+            credentials: config_dir.join(".credentials.json"),
+            config: config_dir.join(".claude.json"),
         }
-        Watch::TokenLine => match scan.cli_token() {
-            Some(t) => {
-                run.cli_token = Some(t);
-                emit(ConnectEvent::CliTokenCaptured);
-                true
-            }
-            None => false,
-        },
     }
 }
 
+/// Poll once. `true` when the run has what it came for: the credential, plus
+/// the account block or the grace period spent waiting for it. The credential
+/// is captured the first time it is seen; only the account is re-polled after.
+fn capture<F: Fn(ConnectEvent)>(
+    paths: &ScratchPaths,
+    scan: &OutputScan,
+    run: &mut Run,
+    emit: &F,
+    grace: &mut Option<tokio::time::Instant>,
+) -> bool {
+    if run.credential.is_none() {
+        let found = read_credentials(&paths.credentials);
+        // On macOS the CLI stores the credential in the login Keychain by
+        // default and writes no file; once the login has announced success,
+        // the scratch dir's own Keychain item is the place to look.
+        #[cfg(target_os = "macos")]
+        let found = found.or_else(|| {
+            let dir = paths.credentials.parent().unwrap_or(&paths.credentials);
+            scan.login_seen
+                .then(|| read_keychain_credentials(dir))
+                .flatten()
+        });
+        #[cfg(not(target_os = "macos"))]
+        let _ = scan;
+        match found {
+            Some(c) => {
+                run.credential = Some(c);
+                emit(ConnectEvent::TokenCaptured);
+                *grace = Some(tokio::time::Instant::now() + ACCOUNT_GRACE);
+            }
+            None => return false,
+        }
+    }
+    if run.account.is_none() {
+        run.account = read_account(&paths.config);
+    }
+    run.account.is_some() || grace.is_some_and(|until| tokio::time::Instant::now() >= until)
+}
+
 /// [`capture`] on the way out. The credential file is written just before the
-/// CLI exits, so that write can land after the exit is observed; the output has
-/// already been drained by then, so the token watch needs no retry.
+/// CLI exits, so that write can land after the exit is observed. There is no
+/// grace here: the CLI is gone, so the account block is there or it is not.
 async fn capture_retrying<F: Fn(ConnectEvent)>(
-    watch: &Watch,
-    cred_path: &Path,
+    paths: &ScratchPaths,
     scan: &OutputScan,
     run: &mut Run,
     emit: &F,
 ) {
+    let mut spent = Some(tokio::time::Instant::now());
     for attempt in 0..CRED_RETRIES {
-        if capture(watch, cred_path, scan, run, emit) || matches!(watch, Watch::TokenLine) {
+        if capture(paths, scan, run, emit, &mut spent) {
             return;
         }
         if attempt + 1 < CRED_RETRIES {
@@ -603,10 +539,9 @@ where
     }
 }
 
-/// The CLI invocation, for either step. `portable-pty` seeds the child env from
-/// the daemon's whole environment, so a pre-set token or provider switch is
-/// removed first: it would make the CLI skip the login, or make `setup-token`
-/// mint against the wrong identity.
+/// The CLI invocation. `portable-pty` seeds the child env from the daemon's
+/// whole environment, so a pre-set token or provider switch is removed first:
+/// it would make the CLI skip the login, or bind another identity.
 pub(crate) fn build_command(config_dir: &Path, args: &[&str]) -> CommandBuilder {
     let mut cmd = CommandBuilder::new(claude_program());
     for arg in args {
@@ -838,50 +773,32 @@ impl Drop for ScratchGuard {
 /// could quote the contents, so nothing is logged with it.
 fn read_credentials(path: &Path) -> Option<Credential> {
     let text = std::fs::read_to_string(path).ok()?;
-    let v: Value = serde_json::from_str(&text).ok()?;
-    let cred = parse_credentials_file(&v);
+    let cred = cuw_switch::parse_cli_json(&text);
     if cred.is_none() {
         tracing::trace!("credentials file not ready");
     }
     cred
 }
 
-/// The Keychain service the CLI keys a custom `CLAUDE_CONFIG_DIR`'s credential
-/// under: `Claude Code-credentials-` + the first 8 hex of SHA-256 over the dir
-/// path, exactly as the env var carries it. Pure and unconditional so the
-/// derivation is testable on every platform.
-pub fn keychain_service(config_dir: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(config_dir.as_os_str().as_encoded_bytes());
-    let mut suffix = String::with_capacity(8);
-    for b in &digest[..4] {
-        use std::fmt::Write;
-        let _ = write!(suffix, "{b:02x}");
-    }
-    format!("Claude Code-credentials-{suffix}")
+/// The `oauthAccount` block of the scratch dir's `.claude.json`, once the CLI
+/// has written one that names an account. Nothing in it is secret.
+fn read_account(path: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let account = v.get("oauthAccount")?;
+    cuw_switch::account_uuid(account)
+        .is_some()
+        .then(|| account.clone())
 }
 
 /// The credential the CLI stored in the login Keychain for this scratch dir,
-/// if any. Same JSON as `.credentials.json`. The item's data is a token, so
-/// neither `security`'s output nor its failure is ever logged.
+/// if any. Same JSON as `.credentials.json`. The item's data is a token, so a
+/// failure to read it is simply `None`.
 #[cfg(target_os = "macos")]
 fn read_keychain_credentials(config_dir: &Path) -> Option<Credential> {
-    let out = std::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            &keychain_service(config_dir),
-            "-w",
-        ])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?;
-    let v: Value = serde_json::from_str(text.trim()).ok()?;
-    parse_credentials_file(&v)
+    let service = cuw_switch::keychain::service(Some(config_dir));
+    let text = cuw_switch::keychain::read(&service).ok().flatten()?;
+    cuw_switch::parse_cli_json(&text)
 }
 
 /// Delete the Keychain item the CLI may have created for `config_dir` — the
@@ -889,54 +806,7 @@ fn read_keychain_credentials(config_dir: &Path) -> Option<Credential> {
 /// this one flow, never the user's real Claude Code login.
 #[cfg(target_os = "macos")]
 pub fn scrub_keychain(config_dir: &Path) {
-    let _ = std::process::Command::new("security")
-        .args([
-            "delete-generic-password",
-            "-s",
-            &keychain_service(config_dir),
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-}
-
-/// Field-by-field parse of the CLI's `.credentials.json`; the shape is
-/// undocumented, so nothing here is trusted (plan §4). `expiresAt` is a
-/// millisecond epoch today; a seconds value is accepted too.
-pub(crate) fn parse_credentials_file(v: &Value) -> Option<Credential> {
-    let o = v.get("claudeAiOauth")?;
-    let access = o
-        .get("accessToken")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())?;
-    let refresh = o
-        .get("refreshToken")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())?;
-    let raw = o.get("expiresAt").and_then(Value::as_f64)?;
-    let expires_at = if raw > 1e11 {
-        (raw / 1000.0) as i64
-    } else {
-        raw as i64
-    };
-    let scopes = o
-        .get("scopes")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(Credential {
-        v: 1,
-        access_token: access.into(),
-        refresh_token: refresh.into(),
-        expires_at,
-        scopes,
-    })
+    cuw_switch::keychain::delete(&cuw_switch::keychain::service(Some(config_dir)));
 }
 
 /// Answer the terminal-capability queries a TUI blocks on. `claude` sends
@@ -986,9 +856,6 @@ struct OutputScan {
     acc: String,
     /// Last emitted line, to drop the TUI's repeated redraws.
     last: String,
-    /// The CLI token, once `setup-token` has finished printing one. Captured
-    /// here rather than re-derived from `acc`, which is trimmed as it grows.
-    token: Option<String>,
     /// The login announced success. Gates the Keychain probe on macOS, so a
     /// `security` process is not spawned on every output chunk.
     login_seen: bool,
@@ -1007,10 +874,6 @@ impl OutputScan {
 
         let clean = strip_ansi(raw);
         self.acc.push_str(&clean);
-        if self.token.is_none() {
-            let found = find_cli_token(&self.acc).map(str::to_string);
-            self.token = found;
-        }
         self.cap_acc();
 
         if !self.await_sent && clean.to_ascii_lowercase().contains("paste code") {
@@ -1028,11 +891,6 @@ impl OutputScan {
                 self.last = s.to_string();
             }
         }
-    }
-
-    /// The captured CLI token, if `setup-token` has printed a complete one.
-    fn cli_token(&self) -> Option<String> {
-        self.token.clone()
     }
 
     /// Keep the accumulator bounded; the prompt is near the end, so trimming
@@ -1150,42 +1008,9 @@ fn skip_escape(b: &[u8], i: usize) -> usize {
     }
 }
 
-/// A marker some CLI versions print a token under. Not what [`find_cli_token`]
-/// keys on — it exists so [`scrub`] stays fail-closed whatever the shape.
+/// A marker some CLI versions print a token under, so [`scrub`] stays
+/// fail-closed whatever the shape.
 const TOKEN_MARKER: &str = "CLAUDE_CODE_OAUTH_TOKEN";
-
-/// The prefix `setup-token`'s token carries: the OAuth access-token family,
-/// which is what `CLAUDE_CODE_OAUTH_TOKEN` binds (SWITCHER §9). The version
-/// digits after it are deliberately not pinned.
-const CLI_TOKEN_PREFIX: &str = "sk-ant-oat";
-
-/// Shortest run accepted as a token. Real ones are ~110 characters; anything
-/// well short of that is a partial repaint, and storing one costs a reconnect.
-const CLI_TOKEN_MIN: usize = 80;
-
-/// The CLI token in `setup-token`'s output, if one has finished printing.
-///
-/// Keyed on the token's own prefix, not on surrounding prose: the output is a
-/// TUI, not a documented contract. Output arrives in PTY chunks, so a run still
-/// at the end of the buffer may be half-written — only a run followed by a
-/// terminator counts. The PTY is opened wide enough ([`TOKEN_COLS`]) that the
-/// line cannot wrap, which is the other way a run could end early.
-fn find_cli_token(acc: &str) -> Option<&str> {
-    let mut from = 0;
-    while let Some(rel) = acc[from..].find(CLI_TOKEN_PREFIX) {
-        let start = from + rel;
-        let run = token_run(&acc[start..]);
-        // Line end only: the CLI prints the token on a line of its own, and
-        // strip_ansi turns every cursor move into `\n` — any other terminator
-        // means the run absorbed adjacent screen text and is not a token.
-        let terminated = matches!(acc.as_bytes().get(start + run.len()), Some(b'\n' | b'\r'));
-        if terminated && run.len() >= CLI_TOKEN_MIN {
-            return Some(run);
-        }
-        from = start + CLI_TOKEN_PREFIX.len();
-    }
-    None
-}
 
 /// The leading run of token-safe (base64url-ish) characters.
 fn token_run(s: &str) -> &str {
@@ -1273,22 +1098,13 @@ mod tests {
 
     const TOKEN: &str = "sk-ant-oat01-FAKEFAKEFAKEFAKEFAKEFAKE0003";
 
-    /// A stand-in for what `setup-token` prints: same prefix, real-ish length.
-    // Real-token length (113): the capture now rejects short runs as partials.
-    const CLI_TOKEN: &str = "sk-ant-oat01-FAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLIFAKECLI00000008";
-
-    fn now() -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp(1_756_600_000).expect("timestamp")
-    }
-
     fn fake_cred(scopes: &[&str]) -> Credential {
-        Credential {
-            v: 1,
-            access_token: TOKEN.into(),
-            refresh_token: "sk-ant-ort01-FAKEFAKEFAKEFAKEFAKEFAKE0004".into(),
-            expires_at: 1_756_600_000,
-            scopes: scopes.iter().map(|s| s.to_string()).collect(),
-        }
+        Credential::new(
+            TOKEN,
+            "sk-ant-ort01-FAKEFAKEFAKEFAKEFAKEFAKE0004",
+            1_756_600_000,
+            scopes.iter().map(|s| s.to_string()).collect(),
+        )
     }
 
     fn sample() -> String {
@@ -1312,8 +1128,7 @@ mod tests {
     }
 
     fn parse(text: &str) -> Option<Credential> {
-        let v: Value = serde_json::from_str(text).ok()?;
-        parse_credentials_file(&v)
+        cuw_switch::parse_cli_json(text)
     }
 
     #[test]
@@ -1455,7 +1270,7 @@ mod tests {
             id: "x-12345678".into(),
             label: "x".into(),
             credential: parse(CREDS_FAKE).expect("parses"),
-            cli_token: Some(CliToken::new(CLI_TOKEN, now())),
+            account: Some(serde_json::json!({"accountUuid":"u","emailAddress":"a@b.c"})),
         };
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("FAKE"), "{dbg}");
@@ -1477,22 +1292,6 @@ mod tests {
             Some("scratch-dir".to_string())
         );
         assert!(cmd.get_env("TERM").is_some());
-    }
-
-    #[test]
-    fn build_command_carries_the_setup_token_subcommand() {
-        let _env = env_guard();
-        let cmd = build_command(Path::new("scratch-dir"), &["setup-token"]);
-        let argv: Vec<String> = cmd
-            .get_argv()
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(argv.len(), 2, "{argv:?}");
-        // On unix the program may be an absolute path (plan §4); the subcommand
-        // is what this pins.
-        assert!(argv[0].ends_with("claude"), "{argv:?}");
-        assert_eq!(argv[1], "setup-token");
     }
 
     /// Windows resolves `claude` through `CreateProcess` exactly as before; the
@@ -1616,31 +1415,6 @@ mod tests {
         assert!(query_reply(b"no queries here").is_empty());
     }
 
-    /// The token arrives across PTY chunks, so a run still at the end of the
-    /// buffer is half-written and must not be captured truncated.
-    #[test]
-    fn a_half_written_token_is_not_captured() {
-        let partial = format!("Your token:\n{}", &CLI_TOKEN[..30]);
-        assert_eq!(find_cli_token(&partial), None);
-        let whole = format!("Your token:\n{CLI_TOKEN}\nPress enter");
-        assert_eq!(find_cli_token(&whole), Some(CLI_TOKEN));
-    }
-
-    /// The 2026-08-31 field bug: the TUI painted the token, moved the cursor,
-    /// and painted prose; with the escapes stripped silently the two glued into
-    /// one run and the stored "token" ended in `...store`. The cursor move must
-    /// become a separator, and the clean token must still come out.
-    #[test]
-    fn a_cursor_move_after_the_token_does_not_glue_ui_text_onto_it() {
-        let raw = format!("{CLI_TOKEN}\x1b[2;5Hcredential-store says hi");
-        let clean = strip_ansi(&raw);
-        assert_eq!(find_cli_token(&clean), Some(CLI_TOKEN));
-
-        // Without a separator the glued run must be rejected, not stored.
-        let glued = format!("{CLI_TOKEN}credential-store ");
-        assert_eq!(find_cli_token(&glued), None);
-    }
-
     /// Color changes are not cursor moves: prose spanning an SGR stays whole,
     /// so cross-chunk prompt detection keeps working.
     #[test]
@@ -1650,68 +1424,70 @@ mod tests {
         assert_eq!(strip_ansi("one\x08two"), "one\ntwo");
     }
 
-    /// Pinned against an independently computed SHA-256: the CLI derives the
-    /// Keychain item from the config-dir string, and a drifted derivation would
-    /// silently miss the credential on every macOS connect.
-    #[test]
-    fn keychain_service_matches_the_cli_derivation() {
+    /// The credential lands first and the account block a moment later: the
+    /// capture waits for the block, then gives up after the grace period.
+    #[tokio::test(start_paused = true)]
+    async fn capture_waits_for_the_account_block_but_not_forever() {
+        // Only the `temp_dir()` read needs the lock, and a guard must not
+        // live across the `advance` below.
+        let dir = {
+            let _env = env_guard();
+            std::env::temp_dir().join(format!("cuw-capture-{}", std::process::id()))
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = ScratchPaths::new(&dir);
+        let scan = OutputScan::default();
+        let events: RefCell<Vec<ConnectEvent>> = RefCell::new(Vec::new());
+        let emit = |e| events.borrow_mut().push(e);
+        let mut run = Run::default();
+        let mut grace = None;
+
+        assert!(!capture(&paths, &scan, &mut run, &emit, &mut grace));
+        assert!(run.credential.is_none());
+
+        std::fs::write(&paths.credentials, CREDS_FAKE).unwrap();
+        assert!(
+            !capture(&paths, &scan, &mut run, &emit, &mut grace),
+            "still waiting"
+        );
+        assert!(run.credential.is_some());
+        assert!(grace.is_some());
         assert_eq!(
-            keychain_service(Path::new("/Users/alice/scratch-creds")),
-            "Claude Code-credentials-f3c4c8d0"
+            events
+                .borrow()
+                .iter()
+                .filter(|e| matches!(e, ConnectEvent::TokenCaptured))
+                .count(),
+            1
         );
-        // Distinct dirs must never share an item.
-        assert_ne!(
-            keychain_service(Path::new("/tmp/a")),
-            keychain_service(Path::new("/tmp/b"))
+
+        std::fs::write(
+            &paths.config,
+            r#"{"oauthAccount":{"accountUuid":"u-1","emailAddress":"a@b.c"},"numStartups":1}"#,
+        )
+        .unwrap();
+        assert!(capture(&paths, &scan, &mut run, &emit, &mut grace));
+        assert_eq!(run.account.as_ref().unwrap()["accountUuid"], "u-1");
+
+        // Without the block, the grace period is the way out.
+        let mut run = Run::default();
+        let mut grace = None;
+        std::fs::remove_file(&paths.config).unwrap();
+        assert!(!capture(&paths, &scan, &mut run, &emit, &mut grace));
+        tokio::time::advance(ACCOUNT_GRACE + Duration::from_millis(1)).await;
+        assert!(capture(&paths, &scan, &mut run, &emit, &mut grace));
+        assert!(run.account.is_none());
+        // Only one capture event per credential, however often it is polled.
+        assert_eq!(
+            events
+                .borrow()
+                .iter()
+                .filter(|e| matches!(e, ConnectEvent::TokenCaptured))
+                .count(),
+            2
         );
-    }
-
-    #[test]
-    fn a_short_run_is_not_a_token() {
-        // The prefix alone, and a run under the minimum, are both redraw noise.
-        assert_eq!(find_cli_token("sk-ant-oat "), None);
-        assert_eq!(find_cli_token("sk-ant-oat01-TOOSHORT "), None);
-    }
-
-    /// A version bump in the prefix must not silently stop the capture.
-    #[test]
-    fn the_prefix_version_digits_are_not_pinned() {
-        let next = CLI_TOKEN.replace("oat01", "oat02");
-        assert_eq!(find_cli_token(&format!("{next}\n")), Some(next.as_str()));
-    }
-
-    #[test]
-    fn the_scan_captures_the_setup_token_output() {
-        let events: RefCell<Vec<ConnectEvent>> = RefCell::new(Vec::new());
-        let mut scan = OutputScan::default();
-        // Split mid-token: the capture must survive the chunk boundary.
-        let (head, tail) = CLI_TOKEN.split_at(20);
-        for chunk in [
-            "\x1b[2J\x1b[HCreated a long-lived (1-year) auth token:\r\n",
-            head,
-            tail,
-            "\r\nPress enter to continue\r\n",
-        ] {
-            scan.feed(chunk, &|e| events.borrow_mut().push(e));
-        }
-        assert_eq!(scan.cli_token().as_deref(), Some(CLI_TOKEN));
-    }
-
-    /// The captured token must never also reach the UI: the same output frames
-    /// go through `scrub` (plan §5).
-    #[test]
-    fn the_captured_token_is_still_redacted_in_the_output_events() {
-        let events: RefCell<Vec<ConnectEvent>> = RefCell::new(Vec::new());
-        let mut scan = OutputScan::default();
-        scan.feed(&format!("token: {CLI_TOKEN}\r\n"), &|e| {
-            events.borrow_mut().push(e)
-        });
-        assert_eq!(scan.cli_token().as_deref(), Some(CLI_TOKEN));
-        for ev in events.borrow().iter() {
-            if let ConnectEvent::Output(line) = ev {
-                assert!(!line.contains("FAKECLI"), "{line}");
-            }
-        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
