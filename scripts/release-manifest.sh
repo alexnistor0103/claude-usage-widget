@@ -22,6 +22,10 @@ rename() {
 }
 
 cd "$dir"
+# An artifact uploaded from several directories keeps them (upload-artifact
+# roots at their common ancestor), so the macOS files arrive as `dmg/…` and
+# `macos/…`; the globs below and the release step both expect one flat dir.
+find . -mindepth 2 -type f -exec mv -f {} . \;
 # One of each is expected; a glob that matches nothing is left alone.
 for f in *-setup.exe; do
     [ -f "$f" ] && rename "$f" "ClaudeUsageWidget_${version}_windows-x64-setup.exe"
