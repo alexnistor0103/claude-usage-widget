@@ -98,6 +98,12 @@ Stop a running daemon before building it:
   `%TEMP%` for it. Never run `claude auth logout`.
 - **Log errors with `%e`, never `?e`.** `keyring::Error::BadEncoding` carries
   the raw blob; `CredError`/`RefreshError` Debug output is not for logs.
+- **The daemon dies before it is overwritten.** It ships as a bundle resource
+  and a running one locks its own exe, so an install that skips it leaves an
+  old daemon under a new overlay — 404s on routes it never had. `update.rs`
+  stops it for the in-app path; `installer-hooks.nsh` kills the overlay and
+  then the daemon for every other install and for uninstall. Both are load
+  bearing: the overlay restarts the daemon whenever the port goes quiet.
 - **Updates are signed.** The updater pubkey lives in `tauri.conf.json`; the
   matching minisign private key is the `TAURI_SIGNING_PRIVATE_KEY` repo secret
   (local copy: `~/.tauri/cuw.key`, never in the repo). A tag build without it
