@@ -119,9 +119,17 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
                 if button == MouseButton::Left && button_state == MouseButtonState::Up {
                     on_left_click(app);
                 }
+                #[cfg(target_os = "macos")]
+                if button == MouseButton::Right && button_state == MouseButtonState::Down {
+                    status_menu::present();
+                }
             }
         })
         .build(app)?;
+    #[cfg(target_os = "macos")]
+    if let Some(tray) = app.tray_by_id("main") {
+        tray.with_inner_tray_icon(|t| status_menu::detach(t.ns_status_item()))?;
+    }
 
     // Managed only once the icon really exists: `exists` is what close-to-hide
     // and the label setters key off, and a hidden window with no tray is a
@@ -377,6 +385,51 @@ pub fn sync_settings(app: &AppHandle, s: &settings::Settings) {
         crate::dock::is_docked(app),
         cfg!(any(windows, target_os = "macos")),
     );
+}
+
+/// macOS 27 gives a click on a status item that owns a menu to the menu, so
+/// the left click never reaches the tray event and the popover never opens.
+/// The menu is kept off the item and attached only while a right click shows it.
+#[cfg(target_os = "macos")]
+mod status_menu {
+    use std::cell::RefCell;
+
+    use objc2::rc::Retained;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSMenu, NSStatusItem};
+
+    thread_local! {
+        // AppKit objects: main thread only, which is where both callers run.
+        static HELD: RefCell<Option<(Retained<NSStatusItem>, Retained<NSMenu>)>> =
+            const { RefCell::new(None) };
+    }
+
+    pub fn detach(item: Option<Retained<NSStatusItem>>) {
+        let (Some(item), Some(mtm)) = (item, MainThreadMarker::new()) else {
+            return;
+        };
+        let Some(menu) = item.menu(mtm) else {
+            return;
+        };
+        item.setMenu(None);
+        HELD.with(|h| *h.borrow_mut() = Some((item, menu)));
+    }
+
+    pub fn present() {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        // Cloned out of the cell: the menu runs a nested event loop.
+        let Some((item, menu)) = HELD.with(|h| h.borrow().clone()) else {
+            return;
+        };
+        item.setMenu(Some(&menu));
+        if let Some(button) = item.button(mtm) {
+            // SAFETY: main thread, and the button belongs to a live status item.
+            unsafe { button.performClick(None) };
+        }
+        item.setMenu(None);
+    }
 }
 
 #[cfg(test)]

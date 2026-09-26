@@ -1,6 +1,6 @@
 [package]
 name = "cuw-overlay"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 
@@ -29,3 +29,17 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "nat
 tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls", "zip"] }
 directories = "5"
 cuw-tracker = { path = "../../../crates/cuw-tracker" }
+
+# The tray's status item (tray.rs): the menu is attached only while presented.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSButton",
+    "NSControl",
+    "NSMenu",
+    "NSResponder",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+] }

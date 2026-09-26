@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-connect"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "cuw-core",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "rand",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-creds"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "cuw-core",
  "keyring",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-daemon"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-switch"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "cuw-core",
  "directories",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "cuw-tracker"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "objc2",
