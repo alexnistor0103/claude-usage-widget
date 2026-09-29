@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+#[allow(unused_imports)]
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, Rect, Wry};
 
 use crate::settings::{self, Mode};
@@ -281,48 +282,152 @@ pub fn hide(app: &AppHandle) {
 /// Where to put the popover for an icon at `rect`: centred on the icon, below
 /// it when the bar is at the top of the screen (macOS), above it otherwise
 /// (a Windows taskbar at the bottom), and always inside the work area.
-fn popover_position(
-    app: &AppHandle,
-    w: &tauri::WebviewWindow,
-    rect: Rect,
-) -> Option<PhysicalPosition<i32>> {
-    // The event rect may be logical on macOS; the icon's own monitor scales it.
+/// Find which monitor contains the tray icon rect.
+/// `app.monitor_from_point` cannot be used directly on macOS because it expects
+/// CoreGraphics logical points while `tray-icon` emits physical pixels.
+fn monitor_for_rect(app: &AppHandle, rect: &Rect) -> Option<tauri::Monitor> {
+    let monitors = app.available_monitors().ok()?;
+    if monitors.is_empty() {
+        return None;
+    }
+
+    let (px, py) = match rect.position {
+        tauri::Position::Physical(p) => (p.x, p.y),
+        tauri::Position::Logical(p) => (p.x as i32, p.y as i32),
+    };
+    let (pw, ph) = match rect.size {
+        tauri::Size::Physical(s) => (s.width as i32, s.height as i32),
+        tauri::Size::Logical(s) => (s.width as i32, s.height as i32),
+    };
+
+    let cx = px + pw / 2;
+    let cy = py + ph / 2;
+
+    // 1. Match by icon center point against monitor physical bounds
+    if let Some(m) = monitors.iter().find(|m| {
+        let m_pos = m.position();
+        let m_size = m.size();
+        cx >= m_pos.x
+            && cx < m_pos.x + m_size.width as i32
+            && cy >= m_pos.y
+            && cy < m_pos.y + m_size.height as i32
+    }) {
+        return Some(m.clone());
+    }
+
+    // 2. Match by icon top-left point against monitor physical bounds
+    if let Some(m) = monitors.iter().find(|m| {
+        let m_pos = m.position();
+        let m_size = m.size();
+        px >= m_pos.x
+            && px < m_pos.x + m_size.width as i32
+            && py >= m_pos.y
+            && py < m_pos.y + m_size.height as i32
+    }) {
+        return Some(m.clone());
+    }
+
+    // 3. Fallback: on macOS, test logical coordinates against CGDisplayBounds via monitor_from_point
+    #[cfg(target_os = "macos")]
+    {
+        for m in &monitors {
+            let scale = m.scale_factor();
+            let lx = px as f64 / scale;
+            let ly = py as f64 / scale;
+            if let Ok(Some(found)) = app.monitor_from_point(lx, ly) {
+                return Some(found);
+            }
+        }
+    }
+
+    // 4. Fallback: app.monitor_from_point with raw probe
     let probe = match rect.position {
         tauri::Position::Physical(p) => (f64::from(p.x), f64::from(p.y)),
         tauri::Position::Logical(p) => (p.x, p.y),
     };
-    let monitor = app
-        .monitor_from_point(probe.0, probe.1)
-        .ok()
-        .flatten()
-        .or_else(|| app.primary_monitor().ok().flatten())?;
+    if let Ok(Some(found)) = app.monitor_from_point(probe.0, probe.1) {
+        return Some(found);
+    }
+
+    None
+}
+
+/// Where to put the popover for an icon at `rect`: centred on the icon, below
+/// it when the bar is at the top of the screen (macOS), above it otherwise
+/// (a Windows taskbar at the bottom), and always inside the work area.
+fn popover_position(
+    app: &AppHandle,
+    w: &tauri::WebviewWindow,
+    rect: Rect,
+) -> Option<tauri::Position> {
+    let monitor = monitor_for_rect(app, &rect).or_else(|| app.primary_monitor().ok().flatten())?;
+
     let scale = monitor.scale_factor();
-    let icon_pos: PhysicalPosition<i32> = rect.position.to_physical(scale);
-    let icon_size: PhysicalSize<u32> = rect.size.to_physical(scale);
-    let win = w.outer_size().ok()?;
-    let area = monitor.work_area();
 
-    let win_w = i32::try_from(win.width).unwrap_or(i32::MAX);
-    let win_h = i32::try_from(win.height).unwrap_or(i32::MAX);
-    let icon_w = i32::try_from(icon_size.width).unwrap_or(0);
-    let icon_h = i32::try_from(icon_size.height).unwrap_or(0);
-    let area_w = i32::try_from(area.size.width).unwrap_or(i32::MAX);
-    let area_h = i32::try_from(area.size.height).unwrap_or(i32::MAX);
-
-    let x = icon_pos.x + icon_w / 2 - win_w / 2;
-    let icon_centre_y = icon_pos.y + icon_h / 2;
-    let bar_on_top = icon_centre_y < area.position.y + area_h / 2;
-    let y = if bar_on_top {
-        icon_pos.y + icon_h + POPOVER_GAP
-    } else {
-        icon_pos.y - win_h - POPOVER_GAP
+    // Icon coordinates in physical and logical
+    let (icon_phys_x, icon_phys_y) = match rect.position {
+        tauri::Position::Physical(p) => (p.x as f64, p.y as f64),
+        tauri::Position::Logical(p) => (p.x * scale, p.y * scale),
     };
-    let max_x = (area.position.x + area_w - win_w).max(area.position.x);
-    let max_y = (area.position.y + area_h - win_h).max(area.position.y);
-    Some(PhysicalPosition::new(
-        x.clamp(area.position.x, max_x),
-        y.clamp(area.position.y, max_y),
-    ))
+    let (icon_phys_w, icon_phys_h) = match rect.size {
+        tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
+        tauri::Size::Logical(s) => (s.width * scale, s.height * scale),
+    };
+
+    let icon_logical_x = icon_phys_x / scale;
+    let icon_logical_y = icon_phys_y / scale;
+    let icon_logical_w = icon_phys_w / scale;
+    let icon_logical_h = icon_phys_h / scale;
+
+    // Window size in logical points. `w.outer_size()` is in physical pixels
+    // for `w`'s current monitor.
+    let win_cur_scale = w.scale_factor().unwrap_or(scale);
+    let win_cur_phys = w.outer_size().ok()?;
+    let win_logical_w = win_cur_phys.width as f64 / win_cur_scale;
+    let win_logical_h = win_cur_phys.height as f64 / win_cur_scale;
+
+    // Work area of the target monitor in logical points
+    let area_phys = monitor.work_area();
+    let area_logical_x = area_phys.position.x as f64 / scale;
+    let area_logical_y = area_phys.position.y as f64 / scale;
+    let area_logical_w = area_phys.size.width as f64 / scale;
+    let area_logical_h = area_phys.size.height as f64 / scale;
+
+    let gap = f64::from(POPOVER_GAP) / scale;
+
+    let x = icon_logical_x + icon_logical_w / 2.0 - win_logical_w / 2.0;
+    let icon_centre_y = icon_logical_y + icon_logical_h / 2.0;
+    let bar_on_top = icon_centre_y < area_logical_y + area_logical_h / 2.0;
+    let y = if bar_on_top {
+        icon_logical_y + icon_logical_h + gap
+    } else {
+        icon_logical_y - win_logical_h - gap
+    };
+
+    let max_x = (area_logical_x + area_logical_w - win_logical_w).max(area_logical_x);
+    let max_y = (area_logical_y + area_logical_h - win_logical_h).max(area_logical_y);
+    let clamped_x = x.clamp(area_logical_x, max_x);
+    let clamped_y = y.clamp(area_logical_y, max_y);
+
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, tao's set_outer_position expects logical points in CoreGraphics
+        // global screen coordinates ((0,0) at top-left of main display, y down).
+        // Passing LogicalPosition ensures tao does not divide by the current window's
+        // scale factor.
+        Some(tauri::Position::Logical(tauri::LogicalPosition::new(
+            clamped_x, clamped_y,
+        )))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let phys_x = (clamped_x * scale).round() as i32;
+        let phys_y = (clamped_y * scale).round() as i32;
+        Some(tauri::Position::Physical(PhysicalPosition::new(
+            phys_x, phys_y,
+        )))
+    }
 }
 
 /// Tray callbacks run on the main thread, so the `is_visible` getter is safe.
